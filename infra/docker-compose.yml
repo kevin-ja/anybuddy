@@ -1,0 +1,53 @@
+name: anybuddy-assistant-v2.0
+
+# El compose vive en infra/, pero el contexto de build de api y bot es la RAIZ
+# del repo (sus Dockerfiles copian apps/... y packages/...). Por eso context: ..
+# Ejecutar desde la raiz del repo:  docker compose -f infra/docker-compose.yml up
+
+services:
+  vector-db:
+    # PRODUCCIÓN: correr previamente el script infra/fetch_vector_db.sh para descargar la base de datos vectorial desde S3.
+    # LOCAL: no ejecutar nada
+    image: chromadb/chroma:1.5.9
+    container_name: anybuddy-vector-db
+    ports:
+      - "8000:8000"
+    volumes:
+      # LOCAL -> default: el indice generado por pipelines/ingestion.
+      # PROD  -> CHROMA_DATA_PATH=/data/chroma_storage (EBS), poblado por el deploy desde S3.
+      - ${CHROMA_DATA_PATH:-../pipelines/ingestion/chroma_storage}:/data
+    environment:
+      - ANONYMIZED_TELEMETRY=FALSE
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    container_name: anybuddy-api
+    ports:
+      - "8080:8000"
+    volumes:
+      # Cache de modelos (embedding/reranker) que la API baja de S3 en runtime.
+      # Named volume => no se re-descargan en cada reinicio.
+      - models_cache:/models
+    env_file:
+      - ../.env
+    depends_on:
+      - vector-db
+    restart: unless-stopped
+
+  bot:
+    build:
+      context: ..
+      dockerfile: apps/bot/Dockerfile
+    container_name: anybuddy-bot
+    # Sin command override: el CMD del Dockerfile ya lanza el bot.
+    env_file:
+      - ../.env
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  models_cache:

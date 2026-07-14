@@ -1,0 +1,26 @@
+# El build context de las imagenes es la raiz del repo. Aqui se excluye todo lo
+# que no debe entrar en NINGUNA imagen: secretos, artefactos pesados, VCS y
+# codigo de otros servicios que no participan del build de ingestion.
+
+# --- Secretos: nunca dentro de una imagen ---
+**/.env
+**/.env.*
+!**/.env.example
+
+# --- Control de versiones / meta ---
+.git
+.gitignore
+**/.DS_Store
+.claude
+
+# --- Caches y artefactos de Python ---
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.venv
+**/venv
+
+# --- Artefactos de datos del pipeline (en prod viven en S3) ---
+**/.models_cache
+**/chroma_storage
+# pipelines/ingestion/knowledge_base

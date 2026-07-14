@@ -1,0 +1,11 @@
+# Artefactos locales de dev — NUNCA se commitean (en prod viven en S3)
+
+# INPUT: corpus (faqs.txt) — prod: S3 anybuddy-knowledge
+knowledge_base/
+# INPUT: modelo embedding — prod: S3 (prefix de modelos)
+.models_cache/
+# OUTPUT: vector db — prod: S3 anybuddy-artifacts
+chroma_storage/
+
+# secretos
+.env

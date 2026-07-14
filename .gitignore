@@ -1,0 +1,11 @@
+# Ingestion pipeline storage
+pipelines/ingestion/chroma_storage/
+pipelines/ingestion/knowledge_base/
+
+# Environment files (anywhere in the tree)
+.env
+**/.env
+
+# macOS
+.DS_Store
+**/.DS_Store

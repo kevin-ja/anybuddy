@@ -1,0 +1,19 @@
+[project]
+name = "model_loader"
+version = "0.1.0"
+description = "Descarga compartida de modelos (embedding/reranker) desde object storage"
+requires-python = ">=3.10"
+dependencies = [
+    "boto3",
+    "sentence-transformers",
+    "transformers",
+    "torch",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["model_loader"]
+package-dir = { "model_loader" = "." }
