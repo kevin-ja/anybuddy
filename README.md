@@ -120,7 +120,7 @@ Agrega la inline policy (política de permisos): El rol ya existe pero no puede 
       "Sid": "WriteVectorDb",
       "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
-      "Resource": ["arn:aws:s3:::anybuddy-artifacts/vector_db/
+      "Resource": ["arn:aws:s3:::anybuddy-artifacts/vector_db/"]
     }
   ]
 }
@@ -132,9 +132,32 @@ Qué hace esta policy, en corto:
 - WriteVectorDb → deja escribir (s3:PutObject) el resultado .tar.gz en el prefijo approved/. (AbortMultipartUpload es por si la subida es grande y se corta a la mitad, para poder limpiar.)
 
 ---
-Parte D — Copiar el ARN y guardarlo en GitHub
+breve resumen:
+1. Identity Provider   ← "AWS, aprendé a reconocer a GitHub"
+        │  (sin esto, AWS no sabe verificar NINGÚN token de GitHub)
+        ▼
+2. Role + Trust Policy ← "y confiá en ESTE repo específico"
+        │  (la trust policy referencia al IdP del paso 1;
+        │   no la podés escribir si el IdP no existe todavía)
+        ▼
+3. Permisos (policy)   ← "y dejá que ese role toque estos buckets"
+        │
+        ▼
+4. AWS_ROLE_ARN en GitHub ← "GitHub, apuntá a ese role"
 
-1. En la página de resumen del role anybuddy-gha-ingest, arriba verás el ARN (Amazon Resource Name, el identificador único del recurso). Cópialo — se ve así:
-arn:aws:iam::123456789012:role/anybuddy-gha-ingest
-2. Ve a tu repositorio en GitHub → Settings → Secrets and variables → Actions → pestaña Variables (variables, no secrets, porque el ARN no es información sensible) → New repository variable.
-3. Nombre: AWS_ROLE_ARN. Valor: el ARN que
+---
+Parte D — Copiar el ARN y guardarlo en GitHub
+Parte 1 — Copiar el ARN
+1. Consola AWS → buscá IAM → menú izquierdo Roles.
+2. Clic en anybuddy-gha-ingest.
+3. En el Summary (arriba) está el campo ARN con un ícono 📋. Copialo.
+
+
+Parte 2 — Guardarlo en GitHub como variable
+Ojo: va como Variable, no como Secret (un ARN no es secreto, y así lo puedes leer/verificar fácil).
+1. Anda al repo en GitHub → Settings (arriba a la derecha).
+2. Menú izquierdo → Secrets and variables → Actions.
+3. Pestaña Variables (no "Secrets") → botón New repository variable.
+4. Name: AWS_ROLE_ARN
+5. Value: pega el ARN que copiaste.
+6. Add variable.
