@@ -5,7 +5,21 @@ pipelines/ingestion/knowledge_base/
 # Environment files (anywhere in the tree)
 .env
 **/.env
+# AWS credentials for local Terraform/CLI (never commit)
+.env.aws
+**/.env.aws
 
 # macOS
 .DS_Store
 **/.DS_Store
+
+
+# otros
+handsoff.md
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfplan

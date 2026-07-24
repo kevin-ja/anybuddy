@@ -4,7 +4,8 @@
 # El contenedor de Chroma luego monta esa ruta como /data (imagen oficial, sin build).
 set -euo pipefail
 
-# SOURCE: S3_INDEX_URI: URI S3 del .tar.gz con el índice de Chroma a descargar (ej. s3://anybuddy-artifacts/approved/index.tar.gz).
+# SOURCE: S3_INDEX_URI: URI S3 del .tar.gz con el índice de Chroma a descargar 
+# (ej. s3://anybuddy-artifacts/vector_db/chroma_storage.tar.gz)
 : "${S3_INDEX_URI:?Define S3_INDEX_URI (p.ej. s3://bucket/approved/index.tar.gz)}"
 
 # SINK: CHROMA_DATA_PATH: ruta en el host que se monta como /data de Chroma 

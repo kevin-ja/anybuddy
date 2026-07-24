@@ -1,163 +1,215 @@
-Las 3 capas, desacopladas — cada una ignora a las otras:
-✅ Real:        [host EC2] baja de S3 → descomprime en /data (EBS)
-                        ↓ bind mount
-                [contenedor chroma] solo lee /data, agnóstico a todo
+# anybuddy 2.0
 
+Bot RAG para Discord. La app corre con `docker compose` (ver `infra/`).
 
-┌───────────────────────────┬───────────────────────────────────────────────────────────────────────┬───────────────────┐
-│           Capa            │                               Qué hace                                │      Cuándo       │
-├───────────────────────────┼───────────────────────────────────────────────────────────────────────┼───────────────────┤
-│ Terraform                 │ Crea EC2 + EBS, y monta el EBS en /data                               │ Una vez           │
-├───────────────────────────┼───────────────────────────────────────────────────────────────────────┼───────────────────┤
-│ deploy.sh (Bash, vía SSM) │ Baja index.tar.gz de S3, lo extrae en /data/chroma, docker compose up │ Cada release      │
-├───────────────────────────┼───────────────────────────────────────────────────────────────────────┼───────────────────┤
-│ docker-compose            │ Monta /data/chroma en el contenedor Chroma                            │ Runtime (siempre) │
-└───────────────────────────┴───────────────────────────────────────────────────────────────────────┴───────────────────┘
-Las tres capas nunca se conocen entre sí:
+## Infraestructura (Terraform)
 
+La infra en AWS se declara con Terraform en `infra/terraform/`, no a mano.
 
-Terraform      →  garantiza que /data (EBS) EXISTE y persiste
-                            │
-Deploy script  →  llena /data con el índice bajado de S3
-                            │
-docker-compose →  monta /data en el contenedor; Chroma lee y ya
+> **Nota sobre la cantidad de archivos.** Terraform lee TODOS los `.tf` de una
+> carpeta como si fueran uno solo; los nombres (`variables.tf`, `main.tf`, …) son
+> solo para ordenar. Acá está partido en varios por convención y por usar
+> "módulos". Si preferís menos archivos, todo esto cabe en 1 o 2 (ver el final).
 
+### Qué es cada archivo, en lenguaje plano
 
-El contenedor es agnóstico porque solo declara volumes: - /data/chroma:/chroma/chroma. Le da igual quién puso los archivos ahí, ni de dónde vinieron. Podría ser S3, un USB, o tu mano — Chroma solo ve una carpeta con su índice. Eso es el desacoplamiento que tu intuición pedía.
+**Archivos de la raíz (`infra/terraform/`)**
 
-Rutas EBS:
-- El EBS no tiene URL. Es un dispositivo (/dev/xvdf) que Terraform monta en /data.
-- Desde ahí, /data/chroma es una ruta de archivos normal — solo que físicamente cae en el EBS (persiste aunque muera la instancia).
+- **`providers.tf`** — Le dice a Terraform *contra qué nube* trabaja (AWS) y
+  *dónde guarda su "libreta"* del estado (en el bucket S3 `anybuddy-artifacts`,
+  carpeta `tfstate/`). Esa libreta es cómo Terraform recuerda qué creó.
 
-El flujo del índice:
-S3 (.tar.gz) → deploy.sh baja y extrae → /data/chroma (EBS) → bind mount → contenedor Chroma
+- **`variables.tf`** — La lista de *perillas configurables* (región, tipo de EC2,
+  tamaño de disco, nombre del bucket). Solo declara que existen y su valor por
+  defecto; no pone los valores finales.
 
-Las 2 ideas que corrigieron tu modelo:
-1. El contenedor Chroma es agnóstico: no toca S3, no descarga nada, solo lee un volumen. volumes: - /data/chroma:/chroma/chroma.
-2. La descarga ocurre fuera del contenedor, en el host, porrantiza que /data exista; deploy.sh lo llena.
+- **`terraform.tfvars`** — Los *valores concretos* de esas perillas. Es el único
+  archivo que tocás para cambiar región, tamaño, etc.
 
-Dónde vive cada cosa en tu repo:
-- infra/docker-compose.yml — los 3 servicios (vacío hoy)
-- infra/deploy/deploy.sh — el script Bash (no existe hoy)
-- Terraform — capa que aún no empiezas
-- .github/workflows/deploy.yml — dispara deploy.sh vía aws
+- **`main.tf`** — El *cableado*: busca la imagen del sistema (Amazon Linux 2023) y
+  arma la infra llamando a los módulos (abajo). Es el "índice" del conjunto.
 
+- **`outputs.tf`** — Lo que Terraform te *imprime al terminar* (ID del EC2, su IP,
+  el ID de la VPC y el ARN del rol). Datos que después necesitás para el disparador
+  event-driven (módulo `events`, más adelante).
 
-# Ingestion
-## Pasos a seguir
-### Nivel 1 — Autenticación de GitHub hacia AWS (OIDC)
-#### Parte A — Crear el identity provider (proveedor de identidad)
+**Módulos (`infra/terraform/modules/`)** — cajitas reutilizables. Cada una trae 3
+archivos: `main.tf` (los recursos), `variables.tf` (lo que recibe) y `outputs.tf`
+(lo que devuelve).
 
-Esto le enseña a AWS a confiar en los tokens que emite GitHub. Se hace una sola vez por cuenta.
-- La URL = confías en el país que emitió el pasaporte (verificas que el sello es auténtico).
-- El Público = confirmas que la visa dentro dice específicamente "válida para entrar a AWS", no a otro lado.
+- **`modules/network/`** — La *red propia*. Crea una **VPC** (`10.0.0.0/16`) con
+  una **subred pública** (`10.0.1.0/24`), un **internet gateway** y su tabla de
+  rutas. No se usa la VPC "default" de AWS (se puede borrar y no siempre existe).
+  La subred es pública porque el EC2 necesita salida a internet (ECR, S3, SSM) y
+  aun así no abre ningún puerto de entrada.
 
-1. Entra a la consola y busca IAM en la barra de búsqueda.
-2. En el menú lateral: Access management (administracion del acceso) → Identity providers (proveedores de identidad).
-3. Click en Add provider (agregar proveedor).
-4. Provider type (tipo de proveedor): elige OpenID Connect.
-5. Provider URL (URL del proveedor): escribe
-https://token.actions.githubusercontent.com
-y luego click en Get thumbprint (obtener huella digital). La consola la calcula sola.
-6. Publico (audience): escribe sts.amazonaws.com
-(STS es el Security Token Service, el servicio que emite los tokens temporales).
-7. Click en Add provider.
+- **`modules/iam/`** — Los *permisos*. Crea el "rol" (instance profile) que usa el
+  EC2 para poder: leer los artefactos de S3 (`knowledge_base/`, `models/`),
+  escribir el índice (`vector_db/`) y ser administrado por **SSM** (ejecutar
+  comandos sin abrir SSH). Con esto el EC2 no necesita access keys en disco.
 
-#### Parte B — Crear el role (rol) que GitHub va a asumir
+- **`modules/compute/`** — La *máquina*. Crea el **EC2** (`t3.small`, donde correrá
+  la ingesta efímera y el `docker compose`) con disco `gp3` de 20 GB, dentro de la
+  subred del módulo `network`, y un **security group** que solo deja salir tráfico
+  (no abre ningún puerto de entrada; se entra por SSM).
 
-1. En IAM, ve a Roles → Create role (crear rol).
-2. Trusted entity type (tipo de entidad de confianza): elige Política de confianza personalizada
-3. en el json pega esto y remmplaza el "ACCOUNT_ID":
+- **`modules/events/`** — *Vacío por ahora* (solo un README). Reservado para el
+  disparador event-driven (EventBridge → SSM; Lambda solo si hace falta lógica)
+  que detecta cambios de artefacto en S3 y ordena la re-ejecución en el EC2.
 
+### Qué crea hoy (Fase 0), en una frase
+
+Una red propia (VPC + subred pública + IGW) con un servidor (EC2) que tiene los
+permisos justos para leer/escribir en S3 y ser operado remotamente por SSM. Nada
+más. La automatización event-driven (módulo `events`) viene después.
+
+### Credenciales — el usuario IAM de Terraform (requisito previo)
+
+Terraform necesita un **usuario IAM** propio (no un rol: los roles no tienen access
+keys, y Terraform se autentica con las 2 llaves). Se crea **una sola vez** en la
+cuenta `176285591978`, distinto del `anybuddy-ingestion` (que solo tiene S3).
+
+- **Qué crear:** un usuario IAM (ej. `anybuddy-terraform`) con **access key**
+  (`AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`).
+- **Qué permisos necesita** (porque va a crear red + EC2 + el rol del EC2):
+
+  | Área | Para qué |
+  |---|---|
+  | **EC2 / VPC** | crear VPC, subred, internet gateway, route table, security group, la instancia EC2 y sus tags |
+  | **SSM (lectura)** | `ssm:GetParameter` sobre los parámetros públicos `/aws/service/*` para resolver la AMI de Amazon Linux 2023 |
+  | **IAM** | crear el **rol + instance profile** del EC2 (`CreateRole`, `AttachRolePolicy`, `CreateInstanceProfile`, `PassRole`) |
+  | **S3** | leer/escribir el **tfstate** en `anybuddy-artifacts/tfstate/*` |
+
+- **Cómo se entregan las llaves:** por variables de entorno (`export
+  AWS_ACCESS_KEY_ID=…` / `AWS_SECRET_ACCESS_KEY=…`), **no** en `~/.aws/credentials`.
+  Mismo mecanismo en local y en CI (GitHub secrets), sin secretos en disco.
+
+**Política mínima (recomendada, no `PowerUserAccess`).** `PowerUserAccess` abre casi
+todos los servicios de AWS (SageMaker, Athena, Bedrock, RDS…); es de más. Se le
+adjunta al usuario una **inline policy** acotada a solo lo que Terraform toca:
+`ec2:*` (que incluye VPC/subred/IGW/route-table/SG/instancia), `ssm:GetParameter`
+solo sobre los parámetros públicos de AWS (`/aws/service/*`, para resolver la AMI),
+S3 solo sobre el bucket `anybuddy-artifacts`, e IAM solo sobre roles/instance-profiles
+`anybuddy-*`:
+
+```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "RedesYEC2",
       "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-        },
-        "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:kevin-ja/anybuddy:*"
-        }
-      }
-    }
-  ]
-}
-
----
-Parte C — Adjuntar los permisos (permissions policy)
-
-1. Haz click en Siguiente (Next).
-2. En la pantalla de permisos, no marques nada (los agregamos después). Click en Siguiente.
-3. Nombre del rol: anybuddy-gha-ingest.
-4. Revisa que todo esté bien y click en Crear rol (Create role).
-
-Agrega la inline policy (política de permisos): El rol ya existe pero no puede hacer nada todavía — no tiene permisos. Se los damos:
-
-1. Ve a Roles, busca anybuddy-gha-ingest y haz click en su nombre.
-2. En la pestaña Permisos (Permissions), busca el botón Agregar permisos (Add permissions) → Crear política insertada (Create inline policy).
-3. Cambia a la pestaña JSON y pega esto (ya está listo para tu bucket anybuddy-artifacts):
-
-{
-  "Version": "2012-10-17",
-  "Statement": [
+      "Action": "ec2:*",
+      "Resource": "*"
+    },
     {
-      "Sid": "ReadKnowledgeAndModel",
+      "Sid": "LeerAMIviaSSM",
       "Effect": "Allow",
-      "Action": ["s3:GetObject"],
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:*::parameter/aws/service/*"
+    },
+    {
+      "Sid": "TfstateYArtefactosS3",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
       "Resource": [
-        "arn:aws:s3:::anybuddy-artifacts/knowledge_base/*",
-        "arn:aws:s3:::anybuddy-artifacts/models/*"
+        "arn:aws:s3:::anybuddy-artifacts",
+        "arn:aws:s3:::anybuddy-artifacts/*"
       ]
     },
     {
-      "Sid": "WriteVectorDb",
+      "Sid": "RolInstanceProfileDelEC2",
       "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
-      "Resource": ["arn:aws:s3:::anybuddy-artifacts/vector_db/"]
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:TagRole",
+        "iam:PassRole",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole",
+        "iam:CreateInstanceProfile",
+        "iam:DeleteInstanceProfile",
+        "iam:GetInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:RemoveRoleFromInstanceProfile"
+      ],
+      "Resource": [
+        "arn:aws:iam::176285591978:role/anybuddy-*",
+        "arn:aws:iam::176285591978:instance-profile/anybuddy-*"
+      ]
     }
   ]
 }
+```
 
-4. Click en Siguiente, nómbrala ingest-s3-access, y Crear política (Create policy).
+> `ec2:*` es **un solo servicio** (VPC y compañía viven en ese namespace), no "todos
+> los servicios". Si en el futuro los recursos IAM del proyecto no siguen el prefijo
+> `anybuddy-*`, ajustá el `Resource` de la última sentencia.
 
-Qué hace esta policy, en corto:
-- ReadKnowledgeAndModel → deja leer (s3:GetObject) el faqs.txt (knowledge_base/*) y el modelo de embedding (models/*).
-- WriteVectorDb → deja escribir (s3:PutObject) el resultado .tar.gz en el prefijo approved/. (AbortMultipartUpload es por si la subida es grande y se corta a la mitad, para poder limpiar.)
+> No usar el perfil `default` del CLI: apunta a otra cuenta (`816069170567`).
+> Verificar con `aws sts get-caller-identity` que responde la cuenta `176285591978`.
 
----
-breve resumen:
-1. Identity Provider   ← "AWS, aprendé a reconocer a GitHub"
-        │  (sin esto, AWS no sabe verificar NINGÚN token de GitHub)
-        ▼
-2. Role + Trust Policy ← "y confiá en ESTE repo específico"
-        │  (la trust policy referencia al IdP del paso 1;
-        │   no la podés escribir si el IdP no existe todavía)
-        ▼
-3. Permisos (policy)   ← "y dejá que ese role toque estos buckets"
-        │
-        ▼
-4. AWS_ROLE_ARN en GitHub ← "GitHub, apuntá a ese role"
+<details>
+<summary><b>Cómo se creó, en 5 pasos (consola IAM)</b></summary>
 
----
-Parte D — Copiar el ARN y guardarlo en GitHub
-Parte 1 — Copiar el ARN
-1. Consola AWS → buscá IAM → menú izquierdo Roles.
-2. Clic en anybuddy-gha-ingest.
-3. En el Summary (arriba) está el campo ARN con un ícono 📋. Copialo.
+1. **Políticas → Create policy →** pestaña JSON → pegar el JSON de arriba →
+   nombrarla `terraform-policy`.
+2. **Users → Create user →** nombre `anybuddy-terraform` (sin acceso a consola).
+3. En permisos: **Attach policies directly →** buscar y marcar `terraform-policy`
+   → **Create user**.
+4. Entrar al usuario → **Security credentials → Create access key →** caso de uso
+   **CLI**.
+5. **Copiar las 2 llaves** en el momento (el *secret* no se vuelve a mostrar) y
+   exportarlas como variables de entorno.
 
+</details>
 
-Parte 2 — Guardarlo en GitHub como variable
-Ojo: va como Variable, no como Secret (un ARN no es secreto, y así lo puedes leer/verificar fácil).
-1. Anda al repo en GitHub → Settings (arriba a la derecha).
-2. Menú izquierdo → Secrets and variables → Actions.
-3. Pestaña Variables (no "Secrets") → botón New repository variable.
-4. Name: AWS_ROLE_ARN
-5. Value: pega el ARN que copiaste.
-6. Add variable.
+### Cargar las credenciales en la terminal
+
+Las llaves viven en `.env.aws` (en la raíz del repo, ignorado por git y docker). Para
+que Terraform/AWS CLI las hereden, hay que **exportarlas** en la sesión:
+
+```bash
+# parado en la raíz del repo
+set -a; source .env.aws; set +a
+aws sts get-caller-identity   # verificá: cuenta 176285591978
+```
+
+- **`set -a`** enciende el modo "exportar todo": lo que se cargue queda disponible para
+  los procesos hijos (Terraform, AWS CLI).
+- **`source .env.aws`** lee el archivo con las llaves (con el modo encendido → se exportan).
+- **`set +a`** apaga el modo (higiene: no exporta variables futuras sin querer).
+
+> Hay que repetirlo en cada terminal nueva. Sin `set -a`, las variables quedan locales y
+> Terraform **no las ve**.
+
+### Uso
+
+```bash
+cd infra/terraform
+terraform init      # descarga el provider de AWS y conecta la libreta (S3)
+terraform plan      # muestra qué va a crear, sin crear nada
+terraform apply     # crea la infra de verdad
+```
+
+> Requisito: el bucket `anybuddy-artifacts` debe existir (ya está) y tener
+> exportadas las credenciales del usuario IAM de arriba en tu entorno.
+
+### ¿Y si quiero MENOS archivos?
+
+Todo lo de arriba se puede aplastar a **un solo `main.tf`** (o `main.tf` +
+`variables.tf`) sin módulos. Se pierde la reutilización, pero para 1 servidor es
+más que suficiente y se lee de un vistazo. Los módulos valen la pena solo cuando
+repetís la misma pieza o el archivo único se vuelve enorme.
