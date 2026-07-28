@@ -16,6 +16,12 @@ variable "artifacts_bucket" {
   default     = "anybuddy-artifacts"
 }
 
+variable "github_repo" {
+  description = "owner/repo de GitHub autorizado a asumir el rol de build vía OIDC."
+  type        = string
+  default     = "kevin-ja/anybuddy"
+}
+
 variable "vpc_cidr" {
   description = "Rango de direcciones IP privadas de la VPC del proyecto."
   type        = string

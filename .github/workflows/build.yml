@@ -1,0 +1,203 @@
+# ¿Cómo se llama el workflow?
+name: build
+
+# ============================================================================
+# WORKFLOW DE BUILD
+# ============================================================================
+# Objetivo:
+#   Construir las imágenes Docker de cada servicio y publicarlas en Amazon ECR.
+#
+# Importante:
+#   - El build ocurre SIEMPRE en el runner de GitHub Actions.
+#   - El servidor EC2 de producción NO compila imágenes.
+#   - El EC2 únicamente hace "docker pull" de imágenes ya construidas.
+#
+# El contexto de build es la raíz del repositorio (.)
+# porque los Dockerfiles copian archivos de apps/, packages/, pipelines/, etc.
+# ============================================================================
+
+# ¿Cuándo debe ejecutarse?
+on:
+  push:
+    # Solo se ejecuta cuando el push fue hacia la rama main.
+    branches: [main]
+
+    # Además, solo si alguno de estos archivos o carpetas cambió.
+    paths:
+      - "apps/**"
+      - "packages/**"
+      - "pipelines/**"
+      - ".dockerignore"
+      - ".github/workflows/build.yml"
+      # Y NUNCA por un cambio de documentación, este donde este
+      - "!**/*.md"
+
+  # Permite ejecutar el workflow manualmente desde la interfaz de GitHub.
+  workflow_dispatch:
+
+# ============================================================================
+# CONCURRENCIA
+# ============================================================================
+# Evita desperdiciar recursos.
+#
+# Si haces dos pushes seguidos:
+#
+# Push A -----> build empieza...
+# Push B -----> GitHub cancela automáticamente el build A
+#               y continúa únicamente con el build B.
+#
+# Así nunca publicas imágenes de un commit que ya quedó obsoleto.
+# ============================================================================
+
+# ¿Qué pasa si llegan varios pushes?
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+# ¿Qué variables globales (disponibles para todos los jobs) tendrá? 
+env:
+  AWS_REGION: us-east-2
+
+# ¿Qué trabajos realizará el workflow?
+jobs:
+  # "build" nombre del job. Puede ser cualquier nombre.
+  build:
+    # ¿En qué máquina se ejecuta?
+    runs-on: ubuntu-latest
+
+    # ¿Qué permisos necesita?
+    permissions:
+      # Permite autenticarse con AWS mediante OIDC.
+      id-token: write
+
+      # Permite leer el contenido del repositorio.
+      contents: read
+
+    # =======================================================================
+    # MATRIZ
+    # =======================================================================
+    # En lugar de escribir tres jobs distintos:
+    #
+    # build-api
+    # build-bot
+    # build-ingestion
+    #
+    # GitHub ejecuta automáticamente el mismo flujo tres veces,
+    # cambiando únicamente las variables de la matriz.
+    # =======================================================================
+    
+    # ¿Cuántas veces se repetirá el job y con qué variables?
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+
+          - service: api
+            dockerfile: apps/api/Dockerfile
+
+          - service: bot
+            dockerfile: apps/bot/Dockerfile
+
+          - service: ingestion
+            dockerfile: pipelines/ingestion/Dockerfile
+    
+    # ¿Qué acciones concretas debe ejecutar, en orden?
+    steps:
+      # ---------------------------------------------------------------------
+      # Descarga el contenido del repositorio al runner.
+      # Equivale a hacer un git clone.
+      # ---------------------------------------------------------------------
+      - name: Checkout del repo
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------
+      # Autenticación con AWS mediante OIDC.
+      #
+      # GitHub solicita credenciales temporales a AWS asumiendo el rol
+      # especificado en AWS_ROLE_ARN.
+      #
+      # No existen Access Keys permanentes almacenadas en GitHub.
+      # ---------------------------------------------------------------------
+      - name: Autenticar en AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        # Aquí with envía parámetros a la acción.
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ---------------------------------------------------------------------
+      # Hace un "docker login" contra Amazon ECR.
+      #
+      # A partir de este punto Docker ya puede hacer:
+      #
+      # docker push
+      #
+      # hacia tu registro privado de ECR.
+      # ---------------------------------------------------------------------
+      - name: Login en ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ---------------------------------------------------------------------
+      # Instala Docker Buildx.
+      #
+      # Buildx es una versión avanzada de "docker build" que agrega:
+      #
+      # • cache
+      # • builds más rápidos
+      # • multiarquitectura
+      # • mejor rendimiento
+      # ---------------------------------------------------------------------
+      - name: Preparar Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ---------------------------------------------------------------------
+      # BUILD + PUSH
+      # ---------------------------------------------------------------------
+      #
+      # Este paso reemplaza comandos como:
+      #
+      # docker build ...
+      # docker push ...
+      #
+      # para cada uno de los servicios.
+      # ---------------------------------------------------------------------
+      - name: Build y push de ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+
+          # Todo el repositorio será el contexto del build.
+          context: .
+
+          # El Dockerfile cambia según la matriz:
+          #
+          # apps/api/Dockerfile
+          # apps/bot/Dockerfile
+          # pipelines/ingestion/Dockerfile
+          file: ${{ matrix.dockerfile }}
+
+          # Cuando termina el build,
+          # publica automáticamente la imagen en Amazon ECR.
+          push: true
+
+          # Dos tags para cada imagen:
+          #
+          # 1. SHA del commit
+          #    Permite saber exactamente qué versión está desplegada.
+          #
+          # 2. latest
+          #    Es la imagen que normalmente utilizará docker compose
+          #    durante el despliegue.
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/anybuddy-${{ matrix.service }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/anybuddy-${{ matrix.service }}:latest
+
+          # Reutiliza capas compiladas anteriormente.
+          # Si solo cambió una parte del Dockerfile,
+          # no reconstruye todo desde cero.
+          cache-from: type=gha,scope=${{ matrix.service }}
+
+          # Guarda la nueva caché para que el siguiente build
+          # también pueda aprovecharla.
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}

@@ -220,6 +220,32 @@ flowchart TB
    imágenes en GitHub Actions (→ ECR); cambiar un artefacto en S3 dispara un *run*
    de la imagen ya construida (evento S3 → EventBridge → SSM → EC2). El EC2 **nunca
    ve el código fuente**: solo baja imágenes ya hechas de ECR.
+
+   > **Por qué el build NO corre en el EC2** (la pregunta que siempre vuelve).
+   > La intuición de "compilar en la misma caja" viene de local, donde
+   > `infra/docker-compose.yml` sí usa `build: context: ..`. La diferencia es que en
+   > prod esa caja **además está atendiendo usuarios**. Cuatro razones concretas:
+   >
+   > 1. **RAM.** El EC2 es `t3.small` (2 GB) y ahí ya viven 3 contenedores, con la API
+   >    cargando embedder + reranker en RAM. Buildear la imagen de ingestion (torch,
+   >    sentence-transformers) compite con el servicio en vivo: swap, o el bot muerto
+   >    por OOM en plena consulta. Subir a `t3.medium` para eso sería pagar el doble
+   >    por un trabajo que el runner de GitHub hace gratis.
+   > 2. **Superficie de credenciales.** Buildear en el EC2 exige el código fuente en la
+   >    máquina → `git clone` → un token o deploy key **guardado en el server**. Eso es
+   >    justo lo que se evita al elegir **ECR sobre GHCR**: el EC2 autentica con su
+   >    *instance profile* (IAM, cero tokens), mientras GHCR obligaría a guardar un
+   >    token de GitHub en la caja. Buildear ahí reintroduce ese token por la ventana.
+   > 3. **Rollback.** Con el build afuera, ECR conserva las **10 imágenes más recientes**
+   >    (lifecycle policy de `modules/ecr/`): si algo sale mal, se vuelve atrás con un
+   >    `pull`. Si el build corre en la caja y falla a mitad, no hay a dónde volver: te
+   >    quedaste sin servicio *y* sin imagen.
+   > 4. **Determinismo.** Un runner efímero arranca limpio siempre. Un servidor que
+   >    lleva meses vivo acumula caché de capas y estado, y "funciona en el server"
+   >    deja de ser reproducible.
+   >
+   > La regla que empaqueta las cuatro: **el runner es desechable, el servidor es
+   > sagrado.** Al servidor solo le llegan artefactos terminados.
 2. **S3 es buzón, no fuente viva:** Chroma lee de `/data` (EBS), nunca de S3 directo.
    S3 solo entrega el `.tar.gz` (`vector_db/chroma_storage.tar.gz`).
 3. **EC2 sin puertas abiertas:** ningún inbound. El bot sale solo hacia Discord; la

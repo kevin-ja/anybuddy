@@ -2,6 +2,129 @@
 
 Bot RAG para Discord. La app corre con `docker compose` (ver `infra/`).
 
+## Flujo CI/CD — vista general
+
+La regla que gobierna todo el pipeline: **código = build; artefacto = run.**
+Son **dos disparadores independientes que no se pisan**. Cambiar *código* solo
+construye imágenes; cambiar un *artefacto* (un dato o un modelo en S3) **no compila
+nada**: re-ejecuta la imagen que ya estaba lista.
+
+```
+                             ¿QUÉ CAMBIÓ?
+                                 │
+           ┌─────────────────────┴──────────────────────┐
+           ▼                                            ▼
+       ┌────────┐                                 ┌───────────┐
+       │ CÓDIGO │                                 │ ARTEFACTO │
+       └────────┘                                 └───────────┘
+   apps/ · packages/ ·                        knowledge_base/faqs.txt
+       pipelines/                                models/…tar.gz
+           │                                            │
+           ▼                                            ▼
+       git push                              subir a S3 anybuddy-artifacts
+           │                                            │
+           ▼                                            ▼
+   GitHub Actions                                evento ObjectCreated
+   runner efímero                                       │
+   OIDC → anybuddy-gha-build                            ▼
+           │                                       EventBridge
+           ▼                                   filtra knowledge_base/
+   docker build × 3                                 y models/
+   api · bot · ingestion                                │
+           │                                            ▼
+           ▼                                     SSM RunCommand
+   docker push → Amazon ECR                    doc. anybuddy-ingest
+   (guarda las 10 últimas)                              │
+           │                                            ▼
+           ▼                                  EC2 · docker run --rm
+     SSM RunCommand                           ingestion → chunking,
+   doc. anybuddy-deploy                       embeddings, Chroma
+           │                                            │
+           ▼                                            ▼
+   EC2 · docker compose pull                   sube vector_db/ a S3
+        docker compose up -d                            │
+           │                                            ▼
+           ▼                                    (nuevo ObjectCreated)
+    chroma · api · bot                                  │
+    en la versión nueva                                 ▼
+                                                   EventBridge
+                                              filtra vector_db/  ← 2ª regla
+                                                        │
+                                                        ▼
+                                                 SSM RunCommand
+                                               doc. anybuddy-refresh
+                                                        │
+                                                        ▼
+                                              EC2 · fetch_vector_db.sh
+                                                   docker compose up -d
+                                                     --force-recreate
+                                                        │
+                                                        ▼
+                                                 chroma · api · bot
+                                                con el índice nuevo
+
+   Las dos ramas corren en el MISMO EC2 (t3.small) y entran siempre por SSM
+   (sin SSH, sin puertos de entrada). Pero son flujos independientes: no se
+   cruzan, no se esperan, y cada una tiene su propio documento.
+```
+
+**Cómo leerlo.** El diagrama arranca con una pregunta, no con un actor: *¿qué cambió?*
+De ahí salen **dos ramas que nunca se cruzan**.
+
+- **Rama CÓDIGO.** Un `git push` dispara GitHub Actions. El runner se autentica contra
+  AWS por **OIDC** (asume `anybuddy-gha-build` con un token temporal: cero access keys
+  guardadas en GitHub), construye las **3** imágenes y las publica en **ECR**. El build
+  **nunca** corre en el EC2 — el porqué está en
+  [`ARCHITECTURE.md`](ARCHITECTURE.md#5-las-3-ideas-clave); la regla corta es *el runner
+  es desechable, el servidor es sagrado*. Con las 3 ya publicadas, el **mismo workflow**
+  manda el RunCommand: dispara **una sola vez, al final** (es el único que sabe cuándo
+  terminaron las tres) y espera el resultado, así un deploy fallido pinta roja la corrida.
+- **Rama ARTEFACTO.** Son **dos saltos, no uno**. Subir `faqs.txt` o el modelo genera un
+  `ObjectCreated` → EventBridge → `anybuddy-ingest` corre la ingesta y publica el índice
+  nuevo en `vector_db/`. Eso genera un **segundo** `ObjectCreated`, que una **segunda
+  regla** convierte en `anybuddy-refresh`: bajar el índice y recrear Chroma.
+- **Lo que comparten es el transporte, no el flujo.** Ambas ramas corren en el mismo EC2
+  y entran siempre por **SSM** (sin SSH, sin puertos de entrada). Pero cada una tiene su
+  propio documento y hace solo lo suyo: un deploy de código no baja el índice, y un cambio
+  de artefacto no hace `pull` de imágenes que no cambiaron. El EC2 se autentica contra ECR
+  con su **instance profile** — cero credenciales en la máquina, y la razón por la que
+  **nunca ve el código fuente**: solo recibe imágenes terminadas.
+
+> **Cuidado con el bucle.** La rama de artefactos se **auto-alimenta**: la ingesta escribe
+> en el mismo bucket que se está vigilando. Es intencional (así encadena el refresh), pero
+> la **primera** regla debe filtrar `knowledge_base/` y `models/` y **no** `vector_db/`, o
+> la ingesta se dispara a sí misma en loop.
+
+> **Por qué `--force-recreate` en el refresh.** `fetch_vector_db.sh` no rellena la carpeta
+> del índice: la **intercambia** por otra con el mismo nombre. El bind mount de Chroma se
+> resuelve una sola vez al arrancar el contenedor y queda enganchado a la carpeta original,
+> así que sin recrear el contenedor seguiría sirviendo el índice viejo — y en silencio.
+
+> **Por qué el deploy lo dispara el workflow y no EventBridge.** Los dos planos
+> parecen simétricos, pero no lo son. Del lado del **artefacto** no hay ningún
+> proceso al que engancharse —alguien sube un archivo a S3 y el evento es la única
+> señal—, por eso hace falta EventBridge. Del lado del **código** sí lo hay: el
+> workflow ya está corriendo, ya tiene identidad OIDC y sabe exactamente cuándo
+> terminaron las 3 imágenes. Reaccionar al push de ECR con EventBridge daría **un
+> redeploy por imagen** (tres seguidos en una caja de 2 GB, y el primero disparado
+> con las otras dos a medio construir) y obligaría a agregar *debounce*.
+> Decidido el 2026-07-26; **todavía sin implementar**.
+
+**Estado de implementación** (al 2026-07-26):
+
+| Pieza | Estado |
+|---|---|
+| VPC + EC2 + IAM + SG (Fase 0) | ✅ aplicado en AWS |
+| Repos ECR + OIDC provider + rol de build | 📝 escrito en `modules/ecr/`, **sin aplicar** |
+| Workflow `.github/workflows/build.yml` | ❌ pendiente |
+| Deploy tras el build (doc. `anybuddy-deploy` + paso en el workflow) | ❌ pendiente (decidido, requiere Fase 0.5) |
+| EventBridge + docs `anybuddy-ingest` / `anybuddy-refresh` (`modules/events/`) | ❌ pendiente (módulo vacío) |
+| `docker-compose.prod.yml` | ❌ vacío (espera las URLs de ECR) |
+
+El detalle fino de cada plano está en [`ARCHITECTURE.md`](ARCHITECTURE.md); el
+detalle de la infra que lo sostiene, en
+[`infra/terraform/readme-terraform.md`](infra/terraform/readme-terraform.md).
+
 ## Infraestructura (Terraform)
 
 La infra en AWS se declara con Terraform en `infra/terraform/`, no a mano.
@@ -77,8 +200,9 @@ cuenta `176285591978`, distinto del `anybuddy-ingestion` (que solo tiene S3).
   |---|---|
   | **EC2 / VPC** | crear VPC, subred, internet gateway, route table, security group, la instancia EC2 y sus tags |
   | **SSM (lectura)** | `ssm:GetParameter` sobre los parámetros públicos `/aws/service/*` para resolver la AMI de Amazon Linux 2023 |
-  | **IAM** | crear el **rol + instance profile** del EC2 (`CreateRole`, `AttachRolePolicy`, `CreateInstanceProfile`, `PassRole`) |
+  | **IAM** | crear el **rol + instance profile** del EC2, el **rol de push a ECR** de GitHub Actions (`anybuddy-gha-build`) y el **OIDC provider** de GitHub |
   | **S3** | leer/escribir el **tfstate** en `anybuddy-artifacts/tfstate/*` |
+  | **ECR** | crear/gestionar los **repos** `anybuddy-api/bot/ingestion` (`ecr:*` acotado a `repository/anybuddy-*`) |
 
 - **Cómo se entregan las llaves:** por variables de entorno (`export
   AWS_ACCESS_KEY_ID=…` / `AWS_SECRET_ACCESS_KEY=…`), **no** en `~/.aws/credentials`.
@@ -143,12 +267,35 @@ S3 solo sobre el bucket `anybuddy-artifacts`, e IAM solo sobre roles/instance-pr
         "iam:DeleteInstanceProfile",
         "iam:GetInstanceProfile",
         "iam:AddRoleToInstanceProfile",
-        "iam:RemoveRoleFromInstanceProfile"
+        "iam:RemoveRoleFromInstanceProfile",
+        "iam:TagInstanceProfile",
+        "iam:UntagInstanceProfile",
+        "iam:UntagRole"
       ],
       "Resource": [
         "arn:aws:iam::176285591978:role/anybuddy-*",
         "arn:aws:iam::176285591978:instance-profile/anybuddy-*"
       ]
+    },
+    {
+      "Sid": "ReposECR",
+      "Effect": "Allow",
+      "Action": "ecr:*",
+      "Resource": "arn:aws:ecr:us-east-2:176285591978:repository/anybuddy-*"
+    },
+    {
+      "Sid": "OidcProviderGitHub",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateOpenIDConnectProvider",
+        "iam:DeleteOpenIDConnectProvider",
+        "iam:GetOpenIDConnectProvider",
+        "iam:TagOpenIDConnectProvider",
+        "iam:UntagOpenIDConnectProvider",
+        "iam:UpdateOpenIDConnectProviderThumbprint",
+        "iam:AddClientIDToOpenIDConnectProvider"
+      ],
+      "Resource": "arn:aws:iam::176285591978:oidc-provider/token.actions.githubusercontent.com"
     }
   ]
 }
@@ -157,6 +304,17 @@ S3 solo sobre el bucket `anybuddy-artifacts`, e IAM solo sobre roles/instance-pr
 > `ec2:*` es **un solo servicio** (VPC y compañía viven en ese namespace), no "todos
 > los servicios". Si en el futuro los recursos IAM del proyecto no siguen el prefijo
 > `anybuddy-*`, ajustá el `Resource` de la última sentencia.
+
+> Las acciones `iam:TagInstanceProfile` / `iam:UntagInstanceProfile` / `iam:UntagRole`
+> se agregaron durante el primer `apply` (2026-07-24): el `default_tags` del provider
+> etiqueta también el instance-profile, y `CreateInstanceProfile` requiere el permiso
+> de tag por separado (a diferencia de `CreateRole`, que lo cubre en la misma llamada).
+> Sin ellas el `apply` falla con `AccessDenied: iam:TagInstanceProfile`.
+
+> Las sentencias `ReposECR` y `OidcProviderGitHub` se agregaron para la fase de **Build CI**
+> (2026-07-24): Terraform crea los repos ECR y el OIDC provider de GitHub (el viejo se borró
+> a mano para que Terraform lo gestione desde cero). El rol `anybuddy-gha-build` no necesita
+> permiso extra aquí: cae bajo la sentencia `role/anybuddy-*` existente.
 
 > No usar el perfil `default` del CLI: apunta a otra cuenta (`816069170567`).
 > Verificar con `aws sts get-caller-identity` que responde la cuenta `176285591978`.

@@ -30,6 +30,18 @@ module "network" {
   public_subnet_cidr = var.public_subnet_cidr
 }
 
+# -- MÓDULO DE REGISTRO DE IMÁGENES + CI (ECR) --
+# Crea los 3 repos de ECR (api, bot, ingestion) donde GitHub Actions sube las imágenes
+# ya construidas. Incluye TAMBIÉN el OIDC provider de GitHub y el rol "anybuddy-gha-build"
+# que el runner asume (vía federación OIDC, sin access keys) SOLO para hacer push a estos
+# repos. Se agrupa todo aquí para que el módulo sea autocontenido (el rol referencia los
+# repos del mismo módulo, sin cables entre módulos).
+module "ecr" {
+  source      = "./modules/ecr"
+  project     = var.project
+  github_repo = var.github_repo
+}
+
 # -- MÓDULO DE MAQUINAS/SERVIDORES (COMPUTE) --
 # Sirve para crear los servidores reales.
 # Lo genial aquí es cómo se conecta con todo lo anterior usando "cables virtuales":

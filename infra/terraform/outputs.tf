@@ -17,3 +17,13 @@ output "instance_role_arn" {
   description = "ARN del rol IAM que asume el EC2."
   value       = module.iam.role_arn
 }
+
+output "ecr_repository_urls" {
+  description = "URLs de los repos ECR (para el docker push y el compose.prod)."
+  value       = module.ecr.repository_urls
+}
+
+output "gha_build_role_arn" {
+  description = "ARN del rol que GitHub Actions asume vía OIDC (va en la variable AWS_ROLE_ARN del repo)."
+  value       = module.ecr.gha_build_role_arn
+}

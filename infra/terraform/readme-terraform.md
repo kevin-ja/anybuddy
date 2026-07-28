@@ -7,6 +7,7 @@ la organización esta hecha en módulos, donde cada uno se encarga de una respon
 - Un módulo se encarga de la **red**.
 - Otro se encarga de los **permisos**.
 - Otro se encarga del **servidor**.
+- Otro se encarga del **registro de imágenes + CI** (ECR + el rol de push de GitHub Actions).
 - Otro se encarga de la infra que se necesita para los **eventos**
 
 La **raíz** (`infra/terraform/main.tf`) es el orquestrador: no crea recursos por su
@@ -20,12 +21,13 @@ infra/terraform/
 ├── providers.tf      # con qué nube hablar y dónde guardar la "memoria" (estado)
 ├── variables.tf      # las "perillas" configurables (región, tamaños, CIDRs...)
 ├── terraform.tfvars  # los valores concretos de esas perillas
-├── main.tf           # el director: consulta la AMI y llama a los 3 módulos
-├── outputs.tf        # los datos que Terraform imprime al terminar (IDs, IP, ARN)
+├── main.tf           # el director: consulta la AMI y llama a los módulos
+├── outputs.tf        # los datos que Terraform imprime al terminar (IDs, IP, ARN, repos ECR)
 └── modules/
     ├── network/      # VPC + subnet pública + internet gateway + rutas
     ├── iam/          # rol + permisos del servidor (S3 mínimo + SSM) + instance profile
     ├── compute/      # el EC2 + su security group (solo salida, sin entrada)
+    ├── ecr/          # 3 repos de imágenes + OIDC de GitHub + rol de push (CI)
     └── events/       # VACÍO por ahora (reservado para el disparador event-driven)
 ```
 
@@ -45,7 +47,9 @@ Primero consulta información existente en AWS (como la última imagen de Amazon
 
 ### `outputs.tf`
 Cuando Terraform termina, imprime datos útiles para los siguientes pasos:
-`instance_id` (para apuntarle con SSM), `instance_public_ip`, `vpc_id` y `instance_role_arn`.
+`instance_id` (para apuntarle con SSM), `instance_public_ip`, `vpc_id`, `instance_role_arn`,
+`ecr_repository_urls` (las URLs de los 3 repos, para el `docker push` y el `compose.prod`) y
+`gha_build_role_arn` (el ARN que va en la variable `AWS_ROLE_ARN` del repo de GitHub).
 
 
 ## 3. Módulos
@@ -94,7 +98,38 @@ Crea:
   subnet, el instance profile y el security group que le llegan como entrada.
 
 
-### 3.4. `modules/events/`
+### 3.4. `modules/ecr/` — registro de imágenes + CI
+
+**Para qué sirve:** guardar las imágenes Docker ya construidas y dejar que **GitHub Actions
+las suba solo**, sin claves de larga vida.
+
+Recordá la regla del proyecto: **código = build; artefacto = run.** El build de las imágenes
+ocurre en un runner efímero de GitHub (nunca en el EC2); este módulo prepara *dónde* se
+guardan y *quién* tiene permiso de subirlas.
+
+Crea:
+- **3 repos ECR** (`anybuddy-api`, `anybuddy-bot`, `anybuddy-ingestion`) con *scan on push*
+  y una **lifecycle policy** que conserva solo las **10 imágenes más recientes** por repo
+  (para que ECR no acumule storage sin límite).
+- El **OIDC provider de GitHub**: es la pieza que permite que el runner de GitHub se
+  autentique en AWS **por federación** (con un token temporal), en vez de guardar access
+  keys en GitHub. AWS solo admite **uno** por cuenta, así que Terraform lo gestiona entero
+  (el provider viejo se borró a mano para que Terraform lo recreara desde cero).
+- El **rol `anybuddy-gha-build`**: el rol que el runner *asume* vía ese OIDC. Su *trust
+  policy* está limitada a **tu repo** (`repo:kevin-ja/anybuddy:*`), y sus permisos son
+  **solo push a estos 3 repos** de ECR (nada más).
+
+**Por qué está todo junto acá (repos + OIDC + rol):** para que el módulo sea
+**autocontenido** — el rol referencia los repos del mismo módulo, sin necesidad de pasar
+datos entre módulos. Es un rol **distinto** del rol del EC2 (`modules/iam/`): ese confía en
+`ec2.amazonaws.com` (lo asume la máquina); este confía en el OIDC de GitHub (lo asume el
+runner). Son dos identidades con dos "confianzas" diferentes.
+
+> Requiere que `terraform-policy` (del usuario `anybuddy-terraform`) tenga permisos de
+> `ecr:*` acotado y de OIDC provider. Ver `README.md` (sección "Credenciales").
+
+
+### 3.5. `modules/events/`
 
 - Para que el evento pueda correr debe existir una infra subyacente.
 - Es eso precisamente lo que hace Terraform: **preparar la infra**
@@ -118,13 +153,16 @@ los permisos, después el servidor que los usa).
 [módulo compute] -(instance_id, public_ip)-> [outputs.tf]
 [módulo network] -(vpc_id)-> [outputs.tf]
 [módulo iam]     -(role_arn)-> [outputs.tf]
+[módulo ecr]     -(repository_urls, gha_build_role_arn)-> [outputs.tf]
 ```
 
 En palabras:
 - El **compute** no sabe fabricar una red ni permisos: **recibe** el `vpc_id` y la subnet del
   **network**, y el `instance_profile` del **iam**, ya hechos.
 - El `ami_id` viene del bloque `data` de `main.tf` (el sistema operativo más reciente).
-- Al final, `outputs.tf` junta los datos clave de los tres para mostrártelos.
+- El **ecr** es autocontenido (no recibe nada de otros módulos, solo el `github_repo`); aporta
+  al final las URLs de los repos y el ARN del rol de build.
+- Al final, `outputs.tf` junta los datos clave de todos para mostrártelos.
 
 ---
 
