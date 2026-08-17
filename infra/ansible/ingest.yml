@@ -46,6 +46,15 @@
     # Sin montar /data/chroma_storage a proposito: el contenedor arma el indice
     # adentro suyo y lo sube a S3. Tocar el indice vivo del host seria escribir
     # por debajo de Chroma mientras esta sirviendo.
+    #
+    # async + poll, y NO en primer plano. Vectorizar tarda ~20 min sin imprimir
+    # nada, y Session Manager corta la sesion a los 20 min SIN TRAFICO. Al morir
+    # la sesion se llevaba puesto el contenedor, porque era su proceso en primer
+    # plano: la ingesta no fallaba, la mataban.
+    #
+    # Con async el contenedor queda suelto del canal SSM y Ansible pregunta cada
+    # 30s como va. Ese ida y vuelta es el trafico que mantiene viva la sesion.
+    # async 3600 = una hora de techo, holgado contra los ~20 min que tarda.
     - name: Vectorizar el knowledge base y publicarlo en S3
       ansible.builtin.command:
         cmd: >-
@@ -54,6 +63,12 @@
           {{ ecr_registry }}/anybuddy-ingestion:latest
       register: ingest_run
       changed_when: true
+      async: 3600
+      poll: 30
+      # No corta aca aunque falle: la ingesta son ~20 min y su salida es el
+      # unico rastro de por que fallo. Si la tarea muere, el play se detiene y
+      # esa salida no se imprime nunca. Se difiere el rojo hasta el final.
+      failed_when: false
 
     - name: Borrar la imagen de ingestion
       ansible.builtin.command:
@@ -65,7 +80,9 @@
 
     - name: Mostrar la salida de la ingesta
       ansible.builtin.debug:
-        msg: "{{ ingest_run.stdout_lines }}"
+        msg: >-
+          {{ ingest_run.stdout_lines | default([])
+             + ingest_run.stderr_lines | default([]) }}
 
     - name: Leer el espacio libre en disco
       ansible.builtin.command:
@@ -76,3 +93,11 @@
     - name: Mostrar el disco
       ansible.builtin.debug:
         msg: "{{ disk_free.stdout_lines }}"
+
+    # El rojo va ultimo, cuando la salida y el disco ya se imprimieron.
+    - name: Fallar si la ingesta no termino bien
+      ansible.builtin.assert:
+        that: ingest_run.rc is defined and ingest_run.rc == 0
+        fail_msg: >-
+          La ingesta salio con rc={{ ingest_run.rc | default('desconocido') }}.
+          El motivo esta en la salida de mas arriba.
