@@ -24,6 +24,6 @@ variable "tfstate_key" {
 }
 
 variable "ssm_transfer_prefix" {
-  description = "Prefijo S3 que el conector aws_ssm de Ansible usa como buzón para pasar ficheros entre el runner y el EC2. Ansible sube ahí y la instancia descarga."
+  description = "Prefijo S3 que el conector aws_ssm de Ansible usa como buzón para pasar ficheros entre el runner y el EC2. Ansible sube ahí y la instancia descarga. Lo impone el conector (<instance_id>/<ruta_remota>), no se configura."
   type        = string
 }

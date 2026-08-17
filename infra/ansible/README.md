@@ -54,10 +54,14 @@ abierto ni clave `.pem` que guardar: el runner de GitHub Actions asume un rol po
 OIDC y abre una sesion de SSM.
 
 Un detalle que no es obvio: la sesion SSM es una **terminal**, no un canal de
-ficheros — no hay `scp`. Para copiar un archivo, el conector lo sube al prefijo
-`ansible-ssm/` del bucket de artefactos y hace que la instancia lo baje. De ahi
-que el permiso este duplicado en las dos identidades (el runner escribe, la caja
-lee), en `infra/terraform/modules/iam/main.tf`.
+ficheros — no hay `scp`. Para copiar un archivo, el conector lo sube al bucket de
+artefactos y hace que la instancia lo baje. De ahi que el permiso este duplicado
+en las dos identidades (el runner escribe, la caja lee), en
+`infra/terraform/modules/iam/main.tf`.
+
+El prefijo **no se puede elegir**: el conector arma la key como
+`<instance_id>/<ruta_remota>`. No existe una opcion `ansible_aws_ssm_bucket_prefix`
+—si se pone, Ansible la ignora sin avisar—, asi que la policy va abierta a `i-*/*`.
 
 Otro: el permiso de `ssm:StartSession` esta acotado **por tag**, no por el ARN de
 la instancia (habria cerrado un ciclo entre los modulos `iam` y `compute`). El tag

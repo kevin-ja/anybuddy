@@ -144,15 +144,10 @@ resource "aws_iam_role_policy" "gha_deploy" {
         Resource = ["arn:aws:s3:::${var.artifacts_bucket}/${var.ssm_transfer_prefix}/*"]
       },
       {
-        Sid      = "AnsibleSsmTransferList"
+        Sid      = "AnsibleSsmBucketLookup"
         Effect   = "Allow"
         Action   = ["s3:ListBucket", "s3:GetBucketLocation"]
         Resource = ["arn:aws:s3:::${var.artifacts_bucket}"]
-        Condition = {
-          StringLike = {
-            "s3:prefix" = ["${var.ssm_transfer_prefix}/*"]
-          }
-        }
       },
       {
         Sid    = "DiscoverManagedInstances"
@@ -180,7 +175,7 @@ resource "aws_iam_role_policy" "gha_deploy" {
         Action = ["ssm:StartSession"]
         Resource = [
           "arn:aws:ssm:${data.aws_region.current.name}::document/AWS-StartSSHSession",
-          "arn:aws:ssm:${data.aws_region.current.name}::document/SSM-SessionManagerRunShell"
+          "arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:document/SSM-SessionManagerRunShell"
         ]
       },
       {

@@ -29,9 +29,9 @@ variable "tfstate_key" {
 }
 
 variable "ssm_transfer_prefix" {
-  description = "Prefijo S3 que el conector aws_ssm de Ansible usa de buzón para copiar ficheros al EC2. La sesión SSM es una terminal, no un canal de archivos: Ansible sube el fichero a S3 y la instancia lo baja."
+  description = "Prefijo S3 que el conector aws_ssm de Ansible usa de buzón para copiar ficheros al EC2. La sesión SSM es una terminal, no un canal de archivos: Ansible sube el fichero a S3 y la instancia lo baja. El valor NO se elige: el conector arma la key como <instance_id>/<ruta_remota> y no admite configurarlo, así que el comodín i-* es el único patrón que matchea."
   type        = string
-  default     = "ansible-ssm"
+  default     = "i-*"
 }
 
 variable "vpc_cidr" {

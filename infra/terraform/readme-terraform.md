@@ -128,7 +128,7 @@ van separadas:
 - un **rol IAM** que el EC2 puede asumir
 - una **política de S3 mínima**: **leer** de `knowledge_base/`, `models/` y `vector_db/`,
   y **escribir** solo en `vector_db/` (nada más),
-- **read/write en `ansible-ssm/`**: el buzón por el que Ansible le pasa ficheros (ver abajo),
+- **read/write en `i-*/`**: el buzón por el que Ansible le pasa ficheros (ver abajo),
 - el permiso **SSM** (`AmazonSSMManagedInstanceCore`) para poder administrar el EC2 sin SSH, y
 - un **instance profile**, que es el envoltorio con el que ese rol se "engancha" a un EC2.
 
@@ -141,7 +141,7 @@ está limitada a tu repo (`repo:kevin-ja/anybuddy:*`). Lleva dos políticas:
   - `ssm:StartSession` **acotado por tag** (`Role = anybuddy-app`) más los documentos
     `AWS-StartSSHSession` y `SSM-SessionManagerRunShell`;
   - `ssm:TerminateSession` / `ResumeSession` / `DescribeInstanceInformation`;
-  - read/write en el prefijo `ansible-ssm/` de S3.
+  - read/write en el prefijo `i-*/` de S3.
 
 > **Por qué el `StartSession` va por tag y no por el ARN de la instancia.** Sería más preciso
 > apuntar al ARN, pero no se puede: `compute` ya depende de `iam` para el instance profile, así

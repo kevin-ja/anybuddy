@@ -203,8 +203,11 @@ bootstrap**, así que es el que tiene que correr primero en una caja recién cre
 > con OIDC igual que para el build.
 >
 > Detalle que sorprende: una sesión SSM es una *terminal*, no un canal de ficheros. Para
-> copiar archivos, Ansible los sube al prefijo `ansible-ssm/` del bucket y la instancia
-> los baja de ahí. Por eso ese permiso de S3 aparece en las **dos** identidades.
+> copiar archivos, Ansible los sube al bucket y la instancia los baja de ahí. Por eso ese
+> permiso de S3 aparece en las **dos** identidades.
+>
+> El prefijo **no se elige**: el conector arma la key como `<instance_id>/<ruta_remota>` y no
+> tiene opción para cambiarlo, así que la política se abre a `i-*/*`.
 
 ```mermaid
 flowchart TB
