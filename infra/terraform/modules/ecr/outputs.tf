@@ -3,7 +3,7 @@ output "repository_urls" {
   value       = { for k, r in aws_ecr_repository.this : k => r.repository_url }
 }
 
-output "gha_build_role_arn" {
-  description = "ARN del rol que GitHub Actions asume vía OIDC para hacer push a ECR."
-  value       = aws_iam_role.gha_build.arn
+output "repository_arns" {
+  description = "ARNs de los repos, para que el módulo iam acote el permiso de push a estos y no a todo ECR."
+  value       = [for r in aws_ecr_repository.this : r.arn]
 }

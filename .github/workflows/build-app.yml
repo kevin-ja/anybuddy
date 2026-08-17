@@ -1,0 +1,211 @@
+# ¿Cómo se llama el workflow?
+name: build-app
+
+# ============================================================================
+# WORKFLOW DE BUILD — PLANO DE LA APP (api y bot)
+# ============================================================================
+# Objetivo:
+#   Construir las imágenes Docker de api y bot y publicarlas en Amazon ECR.
+#
+# La ingesta NO se toca acá: tiene su propio build-ingest.yml. Están separados
+# porque son dos ciclos de vida distintos, y mezclarlos hacía que un error en
+# la ingesta frenara el deploy de la app.
+#
+# Importante:
+#   - El build ocurre SIEMPRE en el runner de GitHub Actions.
+#   - El servidor EC2 de producción NO compila imágenes.
+#   - El EC2 únicamente hace "docker pull" de imágenes ya construidas.
+#
+# El contexto de build es la raíz del repositorio (.)
+# porque los Dockerfiles copian archivos de apps/, packages/, etc.
+# ============================================================================
+
+# ¿Cuándo debe ejecutarse?
+on:
+  push:
+    # Solo se ejecuta cuando el push fue hacia la rama main.
+    branches: [main]
+
+    # Además, solo si alguno de estos archivos o carpetas cambió.
+    paths:
+      - "apps/api/**"
+      - "apps/bot/**"
+      # model_loader lo usan api e ingestion. Por eso figura también en los
+      # paths de build-ingest.yml: un cambio acá dispara los dos builds.
+      - "packages/model_loader/**"
+      - ".dockerignore"
+      - ".github/workflows/build-app.yml"
+      - ".github/actions/ec2-access/**"
+      # Y NUNCA por un cambio de documentación, esté donde esté
+      - "!**/*.md"
+
+  # Permite ejecutar el workflow manualmente desde la interfaz de GitHub.
+  workflow_dispatch:
+
+# ============================================================================
+# CONCURRENCIA
+# ============================================================================
+# Si haces dos pushes seguidos:
+#
+# Push A -----> build empieza...
+# Push B -----> GitHub cancela automáticamente el build A
+#               y continúa únicamente con el build B.
+#
+# Así nunca publicas imágenes de un commit que ya quedó obsoleto.
+# ============================================================================
+concurrency:
+  group: build-app-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-2
+
+jobs:
+  # =========================================================================
+  # QUE HAY QUE RECONSTRUIR
+  # =========================================================================
+  # Compara el commit con el anterior y arma la matriz solo con los servicios
+  # afectados. Sin esto, tocar una linea del bot recompila tambien api, que
+  # arrastra el stack CUDA entero (~7 min tirados).
+  # =========================================================================
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.decidir.outputs.matrix }}
+
+    steps:
+      # fetch-depth 0 porque hace falta el historial para comparar commits.
+      - name: Checkout del repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decidir que servicios cambiaron
+        id: decidir
+        run: |
+          set -euo pipefail
+
+          API='{"service":"api","dockerfile":"apps/api/Dockerfile"}'
+          BOT='{"service":"bot","dockerfile":"apps/bot/Dockerfile"}'
+          AMBAS="[$API,$BOT]"
+
+          # Lanzado a mano, o sin un commit anterior con el que comparar
+          # (primer push, force-push): se reconstruyen las dos.
+          BASE="${{ github.event.before }}"
+          if [ "${{ github.event_name }}" != "push" ] || [ -z "$BASE" ] \
+             || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "Sin base de comparacion: se reconstruyen las dos."
+            echo "matrix=$AMBAS" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          FILES="$(git diff --name-only "$BASE" "${{ github.sha }}")"
+          echo "Archivos cambiados:"
+          echo "$FILES"
+
+          match() { echo "$FILES" | grep -qE "$1"; }
+
+          # Lo que afecta a las dos imagenes por igual.
+          if match '^(\.dockerignore|\.github/workflows/build-app\.yml)$'; then
+            echo "Cambio global: se reconstruyen las dos."
+            echo "matrix=$AMBAS" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # model_loader NO mapea a una sola imagen: lo comparten api e
+          # ingestion (ver los COPY de sus Dockerfiles). El bot no lo usa.
+          SEL=""
+          if match '^(apps/api/|packages/model_loader/)'; then SEL="$SEL,$API"; fi
+          if match '^apps/bot/'; then SEL="$SEL,$BOT"; fi
+
+          echo "matrix=[${SEL#,}]" >> "$GITHUB_OUTPUT"
+          echo "Se reconstruye: [${SEL#,}]"
+
+  build:
+    needs: changes
+
+    # Si no cambio nada que afecte a una imagen, no hay nada que construir.
+    if: needs.changes.outputs.matrix != '[]'
+
+    # ¿En qué máquina se ejecuta?
+    runs-on: ubuntu-latest
+
+    # ¿Qué permisos necesita?
+    permissions:
+      # Permite autenticarse con AWS mediante OIDC.
+      id-token: write
+
+      # Permite leer el contenido del repositorio.
+      contents: read
+
+    # =======================================================================
+    # MATRIZ
+    # =======================================================================
+    # En lugar de escribir dos jobs casi idénticos (build-api, build-bot),
+    # se declara una sola receta y GitHub la corre una vez por servicio,
+    # en paralelo.
+    # =======================================================================
+    strategy:
+      # Si api falla, que bot termine igual: el fallo de uno no dice nada
+      # del otro, y así se ve de una todo lo que está roto.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.matrix) }}
+
+    steps:
+      - name: Checkout del repo
+        uses: actions/checkout@v4
+
+      - name: Autenticar en AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # El ARN de un rol no es un secreto: es un identificador público,
+          # inútil sin un token OIDC firmado por GitHub desde este repo.
+          # Por eso va en Variables y no en Secrets.
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login en ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # buildx hace falta para la caché de capas (cache-from / cache-to).
+      - name: Preparar buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build y push de ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          # Todo el repositorio será el contexto del build.
+          context: .
+
+          # El Dockerfile cambia según la matriz:
+          #
+          # apps/api/Dockerfile
+          # apps/bot/Dockerfile
+          file: ${{ matrix.dockerfile }}
+
+          # Cuando termina el build,
+          # publica automáticamente la imagen en Amazon ECR.
+          push: true
+
+          # Dos tags para cada imagen:
+          #
+          # 1. SHA del commit
+          #    Permite saber exactamente qué versión está desplegada.
+          #
+          # 2. latest
+          #    Es la imagen que normalmente utilizará docker compose
+          #    durante el despliegue.
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/anybuddy-${{ matrix.service }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/anybuddy-${{ matrix.service }}:latest
+
+          # Reutiliza capas compiladas anteriormente.
+          # Si solo cambió una parte del Dockerfile,
+          # no reconstruye todo desde cero.
+          cache-from: type=gha,scope=${{ matrix.service }}
+
+          # Guarda la nueva caché para que el siguiente build
+          # también pueda aprovecharla.
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}

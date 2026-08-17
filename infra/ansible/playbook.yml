@@ -1,0 +1,247 @@
+---
+# ============================================================================
+# UN PLAYBOOK, DOS DEPLOYS
+# ============================================================================
+# Lo invocan deploy-app.yml y deploy-db-vector.yml, cada uno con sus etiquetas.
+# Se hizo con tags y no con dos playbooks separados para no duplicar el bloque
+# de bootstrap ni el de checking, que son identicos en los dos casos.
+#
+#   --tags bootstrap,app   -> deploy-app.yml
+#       Prepara la caja (Docker, /opt/anybuddy, .env.prod) y levanta los
+#       contenedores con las imagenes nuevas de ECR.
+#
+#   --tags vector-db       -> deploy-db-vector.yml (con -e refresh_index=true)
+#       Baja el indice de S3 y recrea SOLO el contenedor vector-db. No toca
+#       api ni bot, que no cambiaron.
+#
+#   sin --tags             -> todo junto. Util para correrlo a mano.
+#
+# Las tareas con tag "always" corren siempre: son las comprobaciones de entrada
+# y el reporte final.
+# ============================================================================
+- name: Desplegar anybuddy
+  hosts: anybuddy-app
+  gather_facts: true
+
+  tasks:
+    # ========================= COMPROBAR =========================
+
+    - name: Verificar que llegaron los datos de la infra
+      ansible.builtin.assert:
+        that:
+          - instance_id is defined and instance_id | length > 0
+          - ecr_registry is defined and ecr_registry | length > 0
+        fail_msg: >-
+          Faltan instance_id y/o ecr_registry. Salen de `terraform output`:
+          terraform -chdir=../terraform output -raw instance_id
+      tags: [always]
+
+    - name: Leer el .env.prod del entorno
+      ansible.builtin.set_fact:
+        env_prod_content: "{{ lookup('env', 'ENV_PROD') }}"
+      no_log: true
+      tags: [bootstrap]
+
+    - name: Verificar que el .env.prod tiene los secretos
+      ansible.builtin.assert:
+        that:
+          - env_prod_content | length > 0
+          - env_prod_content is search('(?m)^OPENAI_API_KEY=.+')
+          - env_prod_content is search('(?m)^DISCORD_BOT_TOKEN=.+')
+        fail_msg: >-
+          ENV_PROD viene vacio o le faltan OPENAI_API_KEY / DISCORD_BOT_TOKEN.
+          Revisar el secret ENV_PROD del repo.
+      no_log: true
+      tags: [bootstrap]
+
+    # ====================== INSTALAR DOCKER ======================
+
+    - name: Instalar Docker
+      ansible.builtin.dnf:
+        name: docker
+        state: present
+      tags: [bootstrap]
+
+    - name: Arrancar Docker y dejarlo habilitado al reinicio
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+      tags: [bootstrap]
+
+    - name: Dejar a ec2-user en el grupo docker
+      ansible.builtin.user:
+        name: ec2-user
+        groups: docker
+        append: true
+      tags: [bootstrap]
+
+    - name: Crear Directorio donde se instalará docker-compose v2
+      ansible.builtin.file:
+        path: /usr/local/lib/docker/cli-plugins
+        state: directory
+        mode: "0755"
+      tags: [bootstrap]
+
+    - name: Instalar el plugin docker compose {{ compose_version }}
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/docker/compose/releases/download/{{ compose_version }}/docker-compose-linux-x86_64
+        dest: /usr/local/lib/docker/cli-plugins/docker-compose
+        mode: "0755"
+      tags: [bootstrap]
+
+    # ====================== COPIAR ARCHIVOS ======================
+
+    - name: Crear {{ app_dir }}
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+      tags: [bootstrap]
+
+    # Es template y no copy porque el mount de Chroma sale de chroma_data_path.
+    # El valor se escribe UNA vez en group_vars y de ahi lo heredan el compose y
+    # fetch_vector_db.sh, que tienen que coincidir si o si.
+    - name: Copiar el docker-compose file de produccion
+      ansible.builtin.template:
+        src: templates/docker-compose.prod.yml
+        dest: "{{ app_dir }}/docker-compose.prod.yml"
+        mode: "0644"
+      register: compose_file
+      tags: [bootstrap]
+
+    - name: Copiar fetch_vector_db.sh
+      ansible.builtin.copy:
+        src: files/fetch_vector_db.sh
+        dest: "{{ app_dir }}/fetch_vector_db.sh"
+        mode: "0755"
+      tags: [bootstrap]
+
+    - name: Escribir el .env.prod
+      ansible.builtin.copy:
+        content: "{{ env_prod_content }}"
+        dest: "{{ app_dir }}/.env.prod"
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      register: env_file
+      tags: [bootstrap]
+
+    - name: Autenticar Docker contra ECR
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          aws ecr get-login-password --region {{ aws_region }} |
+          docker login --username AWS --password-stdin {{ ecr_registry }}
+        executable: /bin/bash
+      changed_when: false
+      tags: [bootstrap]
+
+    # ====================== SET THE INDEX VECTOR DB =======================
+
+    # Corriendo con --tags vector-db el bootstrap no paso por aca, asi que hay
+    # que confirmar que la caja ya esta preparada. Si falta el .env.prod es que
+    # nunca corrio deploy-app.yml en esta instancia.
+    - name: Verificar que la caja ya paso por el deploy de la app
+      ansible.builtin.stat:
+        path: "{{ app_dir }}/.env.prod"
+      register: env_prod_file
+      tags: [vector-db]
+
+    - name: Fallar si la caja no esta preparada
+      ansible.builtin.assert:
+        that: env_prod_file.stat.exists
+        fail_msg: >-
+          No existe {{ app_dir }}/.env.prod. Correr antes el workflow
+          deploy-app, que es el que hace el bootstrap de la caja.
+      tags: [vector-db]
+
+    - name: Crear el directorio del indice de Chroma
+      ansible.builtin.file:
+        path: "{{ chroma_data_path }}"
+        state: directory
+        mode: "0755"
+      register: chroma_dir
+      tags: [bootstrap, vector-db]
+
+    # Se baja el indice en dos casos: cuando la caja todavia no lo tiene
+    # (primera corrida) o cuando se pide explicitamente con refresh_index.
+    # Un deploy de codigo no cambia el indice, y rebajarlo obligaria a
+    # reiniciar Chroma sin motivo.
+    #
+    # El failed_when distingue los dos casos: si se pidio el refresh, que
+    # falle es un fallo de verdad y tiene que pintar rojo. Si es solo el
+    # bootstrap de una caja virgen, se tolera porque puede no haber indice
+    # todavia (nunca corrio la ingesta).
+    #
+    # El export de CHROMA_DATA_PATH va DESPUES del source a proposito: manda
+    # group_vars, no lo que diga el .env.prod. Es la misma variable que rellena
+    # el mount del compose, asi que el script llena exactamente la carpeta que
+    # Chroma monta. Si se desalinearan, no falla nada: Chroma sirve el indice
+    # viejo (o vacio) y el job igual sale verde.
+    - name: Bajar el indice de Chroma desde S3
+      ansible.builtin.shell:
+        cmd: >-
+          set -a && . {{ app_dir }}/.env.prod && set +a &&
+          export CHROMA_DATA_PATH={{ chroma_data_path }} &&
+          {{ app_dir }}/fetch_vector_db.sh
+        executable: /bin/bash
+      when: chroma_dir.changed or refresh_index | bool
+      register: index_fetch
+      changed_when: index_fetch.rc == 0
+      failed_when: refresh_index | bool and index_fetch.rc != 0
+      tags: [bootstrap, vector-db]
+
+    # ====================== CREACIÓN DE CONTENEDORES ========================
+
+    - name: Descargar las imagenes del ECR
+      ansible.builtin.command:
+        cmd: docker compose -f {{ app_dir }}/docker-compose.prod.yml pull
+      register: compose_pull
+      changed_when: true
+      tags: [app]
+
+    - name: Levantar los 3 contenedores (vector-db, app, discord-bot)
+      ansible.builtin.command:
+        cmd: docker compose -f {{ app_dir }}/docker-compose.prod.yml up -d
+      register: compose_up
+      changed_when: true
+      tags: [app]
+
+    # fetch_vector_db.sh no rellena la carpeta del indice: la reemplaza por otra
+    # con el mismo nombre. El contenedor sigue montando la vieja y sirve datos
+    # viejos sin avisar. Recrearlo es la unica forma de que agarre la nueva.
+    #
+    # Se nombra vector-db a proposito: api y bot no se tocan, solo cambio el
+    # indice. Si el contenedor no existia todavia, este mismo comando lo crea.
+    - name: Recrear vector-db si se bajo un indice nuevo
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ app_dir }}/docker-compose.prod.yml
+          up -d --force-recreate vector-db
+      when: index_fetch is changed
+      changed_when: true
+      tags: [bootstrap, vector-db]
+
+    # ========================== CHECKING ==========================
+
+    - name: Leer el estado de los contenedores
+      ansible.builtin.command:
+        cmd: docker compose -f {{ app_dir }}/docker-compose.prod.yml ps
+      register: compose_ps
+      changed_when: false
+      tags: [always]
+
+    - name: Leer el espacio libre en disco
+      ansible.builtin.command:
+        cmd: df -h /
+      register: disk_free
+      changed_when: false
+      tags: [always]
+
+    - name: Mostrar el estado final
+      ansible.builtin.debug:
+        msg: "{{ compose_ps.stdout_lines + [''] + disk_free.stdout_lines }}"
+      tags: [always]

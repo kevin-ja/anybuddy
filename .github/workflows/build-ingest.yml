@@ -1,0 +1,83 @@
+name: build-ingest
+
+# ============================================================================
+# WORKFLOW DE BUILD — PLANO DEL ARTEFACTO (la imagen de ingesta)
+# ============================================================================
+# Objetivo:
+#   Construir la imagen anybuddy-ingestion y publicarla en Amazon ECR.
+#
+# Ojo con lo que este workflow NO hace: construir la imagen no ejecuta nada.
+# Una imagen nueva es una receta nueva, no un plato cocinado. De ejecutarla se
+# encarga ingest.yml, que arranca solo cuando este workflow termina bien.
+#
+# Esta separado de build-app.yml porque son dos ciclos de vida distintos:
+#   - api y bot son ESTADO: la imagen nueva se despliega y listo.
+#   - la ingesta es un EVENTO: la imagen nueva hay que correrla para que
+#     produzca el vector_db.
+# Mezclarlos hacia que un fallo de la ingesta (20 min) frenara el deploy de la
+# app, que no tenia nada que ver.
+# ============================================================================
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pipelines/ingestion/**"
+      # model_loader lo comparten api e ingestion. Por eso figura tambien en
+      # los paths de build-app.yml: un cambio aca dispara los dos builds.
+      - "packages/model_loader/**"
+      - ".dockerignore"
+      - ".github/workflows/build-ingest.yml"
+      - "!**/*.md"
+
+  # A mano: reconstruye la imagen sin ingestar. Util para rehacer un build que
+  # fallo por una causa externa (red, ECR) sin gastar los 20 min de ingesta.
+  workflow_dispatch:
+
+concurrency:
+  group: build-ingest-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-2
+
+jobs:
+  # Una sola imagen: no hace falta matriz. El filtro de paths ya garantiza que
+  # este workflow solo corre cuando cambio algo que le incumbe.
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout del repo
+        uses: actions/checkout@v4
+
+      - name: Autenticar en AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login en ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Preparar buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Tarda ~15 min: requirements.txt trae torch con el stack CUDA entero,
+      # inutil en un t3.small sin GPU. Deuda asumida a proposito.
+      - name: Build y push de ingestion
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: pipelines/ingestion/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/anybuddy-ingestion:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/anybuddy-ingestion:latest
+          cache-from: type=gha,scope=ingestion
+          cache-to: type=gha,mode=max,scope=ingestion

@@ -1,0 +1,91 @@
+name: ingest
+
+# ============================================================================
+# WORKFLOW DE INGESTA — ejecutar la imagen y producir el vector_db
+# ============================================================================
+# Objetivo:
+#   Correr la imagen anybuddy-ingestion en el EC2, vectorizar el knowledge base
+#   y publicar el indice en s3://anybuddy-artifacts/vector_db/.
+#
+# Aca TERMINA en S3. Dejar ese indice sirviendo en la caja es trabajo de
+# deploy-db-vector.yml, que arranca solo cuando este workflow termina bien.
+#
+# ES MIXTO, automatico y manual, porque hay dos motivos para re-ingestar y son
+# de naturaleza distinta:
+#
+#   - CAMBIO EL CODIGO -> automatico. El sistema ya sabe que cambio: el push
+#     lo disparo, build-ingest.yml lo construyo y encadenar sale gratis.
+#     Sin esto, la imagen nueva se queda en ECR sin ejecutarse y el bot sigue
+#     respondiendo con un indice que produjo el codigo viejo.
+#
+#   - CAMBIO EL faqs.txt -> a mano. El que se entera es una persona, que va a
+#     entrar igual a subir el archivo a S3. Apretar "Run workflow" no le cuesta
+#     mas, y da log, historial y boton de reintento.
+# ============================================================================
+
+on:
+  workflow_run:
+    workflows: [build-ingest]
+    types: [completed]
+    branches: [main]
+
+  workflow_dispatch:
+
+# Mismo grupo que deploy-app y deploy-db-vector: los tres entran a la misma
+# caja y no pueden pisarse. Ver el comentario largo en deploy-app.yml.
+concurrency:
+  group: ec2
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  ARTIFACTS_BUCKET: anybuddy-artifacts
+  TFSTATE_KEY: tfstate/anybuddy.tfstate
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+
+    # Si el build de la imagen fallo, no hay nada nuevo que ejecutar.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout del repo
+        uses: actions/checkout@v4
+
+      - name: Preparar el acceso al EC2
+        id: ec2
+        uses: ./.github/actions/ec2-access
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-arn: ${{ vars.AWS_ROLE_ARN }}
+          artifacts-bucket: ${{ env.ARTIFACTS_BUCKET }}
+          tfstate-key: ${{ env.TFSTATE_KEY }}
+
+      # -----------------------------------------------------------------------
+      # Tarda 15-20 min. El runner se queda esperando porque es el control
+      # remoto: abre la sesion SSM, manda las ordenes y relaya la salida. El
+      # trabajo pesado corre en el EC2.
+      #
+      # El playbook corre la imagen :latest, que es la que build-ingest.yml
+      # acaba de publicar. Lanzado a mano justo despues de pushear codigo de la
+      # ingesta, esperar a que ese build termine o se ingesta con la vieja.
+      #
+      # No lleva ENV_PROD: la ingesta no escribe el .env.prod, lo consume. Si
+      # no esta en la caja, el playbook falla con un mensaje claro pidiendo que
+      # se corra deploy-app.yml primero.
+      # -----------------------------------------------------------------------
+      - name: Correr la ingesta
+        working-directory: infra/ansible
+        env:
+          ANSIBLE_FORCE_COLOR: "1"
+        run: |
+          ansible-playbook ingest.yml \
+            -e instance_id=${{ steps.ec2.outputs.instance_id }} \
+            -e ecr_registry=${{ steps.ec2.outputs.ecr_registry }}

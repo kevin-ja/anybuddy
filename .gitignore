@@ -5,6 +5,8 @@ pipelines/ingestion/knowledge_base/
 # Environment files (anywhere in the tree)
 .env
 **/.env
+.env.prod
+**/.env.prod
 # AWS credentials for local Terraform/CLI (never commit)
 .env.aws
 **/.env.aws

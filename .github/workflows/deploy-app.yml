@@ -1,0 +1,117 @@
+name: deploy-app
+
+# ============================================================================
+# WORKFLOW DE DEPLOY — PLANO DE LA APP (api y bot)
+# ============================================================================
+# Objetivo:
+#   Dejar el EC2 corriendo la version actual de api y bot, con Ansible.
+#
+# Aca no se compila nada: build-app.yml ya subio las imagenes a ECR. Se entra a
+# la caja y se le dice que las baje y las levante.
+#
+# Este workflow es ademas el BOOTSTRAP de la caja: instala Docker, escribe
+# /opt/anybuddy y deja el .env.prod. Por eso corre con las etiquetas
+# "bootstrap,app". Es el que tiene que correr PRIMERO en un EC2 recien creado:
+# deploy-db-vector.yml e ingest.yml dan por hecho que ya paso por aca.
+# ============================================================================
+
+on:
+  # --------------------------------------------------------------------------
+  # Se dispara CUANDO TERMINA el build, no con el push.
+  #
+  # Con "on: push" el deploy arrancaria EN PARALELO al build y desplegaria
+  # imagenes a medio subir, o directamente las del commit anterior.
+  #
+  # OJO: workflow_run solo funciona si este archivo esta en la rama por
+  # defecto (main). En una rama no se dispara, ni para probarlo.
+  # --------------------------------------------------------------------------
+  workflow_run:
+    workflows: [build-app]
+    types: [completed]
+    branches: [main]
+
+  # Permite lanzarlo a mano, sin tener que tocar codigo para forzar un
+  # redeploy. Es tambien la forma de hacer el bootstrap de una caja nueva.
+  workflow_dispatch:
+
+# ============================================================================
+# CONCURRENCIA
+# ============================================================================
+# Grupo "ec2", COMPARTIDO con ingest.yml y deploy-db-vector.yml.
+#
+# Son tres workflows que entran a la misma caja, y es un t3.small con 2 GB de
+# RAM y 20 GB de disco. Dos de ellos a la vez se pisan los archivos de
+# /opt/anybuddy, y una ingesta corriendo mientras se baja una imagen de 6.5 GB
+# es la forma mas facil de quedarse sin disco o sin memoria. Con un solo grupo
+# hacen fila en vez de chocar.
+#
+# cancel-in-progress FALSE a proposito: cancelar un deploy a mitad de camino
+# deja la caja a medio configurar (p.ej. el .env.prod nuevo escrito pero los
+# contenedores todavia con la imagen vieja).
+# ============================================================================
+concurrency:
+  group: ec2
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  ARTIFACTS_BUCKET: anybuddy-artifacts
+  # Tiene que coincidir con el backend de infra/terraform/providers.tf y con
+  # var.tfstate_key. El bloque backend no admite variables, asi que el valor se
+  # repite a mano en los tres lados.
+  TFSTATE_KEY: tfstate/anybuddy.tfstate
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    # Si el build fallo o fue cancelado, no hay imagenes nuevas que desplegar.
+    # workflow_run se dispara igual cuando el build termina MAL, asi que el
+    # filtro va aca. En workflow_dispatch no hay build previo que mirar.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    permissions:
+      # Para autenticarse con AWS por OIDC, sin access keys.
+      id-token: write
+      contents: read
+
+    steps:
+      # El repo se necesita por el playbook y por files/ (el compose y el
+      # script que Ansible copia a la caja).
+      - name: Checkout del repo
+        uses: actions/checkout@v4
+
+      - name: Preparar el acceso al EC2
+        id: ec2
+        uses: ./.github/actions/ec2-access
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-arn: ${{ vars.AWS_ROLE_ARN }}
+          artifacts-bucket: ${{ env.ARTIFACTS_BUCKET }}
+          tfstate-key: ${{ env.TFSTATE_KEY }}
+
+      # -----------------------------------------------------------------------
+      # Etiquetas "bootstrap,app":
+      #   bootstrap -> Docker, /opt/anybuddy, compose, .env.prod, login en ECR
+      #   app       -> compose pull + up -d de los servicios
+      #
+      # NO lleva la etiqueta "vector-db": bajar el indice no es asunto de un
+      # deploy de codigo, y hacerlo obligaria a reiniciar Chroma sin motivo.
+      # La unica excepcion la resuelve el propio playbook: si la caja todavia
+      # no tiene indice (primera corrida), lo baja igual.
+      #
+      # ENV_PROD va por VARIABLE DE ENTORNO y no por -e: los extra-vars quedan
+      # visibles en la lista de procesos del runner.
+      # -----------------------------------------------------------------------
+      - name: Desplegar api y bot
+        working-directory: infra/ansible
+        env:
+          ENV_PROD: ${{ secrets.ENV_PROD }}
+          ANSIBLE_FORCE_COLOR: "1"
+        run: |
+          ansible-playbook playbook.yml \
+            --tags bootstrap,app \
+            -e instance_id=${{ steps.ec2.outputs.instance_id }} \
+            -e ecr_registry=${{ steps.ec2.outputs.ecr_registry }}

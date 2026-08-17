@@ -1,0 +1,69 @@
+name: anybuddy-assistant-v2.0
+
+# Compose de PRODUCCIÓN. Es una plantilla: Ansible la renderiza al copiarla, así
+# que lo que se edita acá NO es lo que corre en la caja hasta el próximo deploy.
+# Termina en el EC2, en /opt/anybuddy/docker-compose.prod.yml, junto a .env.prod y
+# fetch_vector_db.sh. Se usa con UN solo -f (los documentos SSM lo invocan así):
+#   docker compose -f /opt/anybuddy/docker-compose.prod.yml pull
+#   docker compose -f /opt/anybuddy/docker-compose.prod.yml up -d
+#
+# Es un archivo AUTÓNOMO, no un override de docker-compose.yml. Dos razones:
+# 1. En prod la caja no tiene el repo, así que las rutas relativas del compose
+#    local (../.env, ../pipelines/...) no existen.
+# 2. Un override NO puede BORRAR la clave build:. Si heredara el build: del
+#    archivo local, Compose intentaría compilar la imagen aunque haya image:,
+#    y en el EC2 no hay código fuente que compilar.
+#
+# La ingesta NO está acá: es un proceso efímero (docker run --rm) que lanza el
+# workflow ingest.yml, no un servicio permanente.
+
+services:
+  vector-db:
+    # Imagen oficial de Docker Hub, no de ECR: no la construimos nosotros.
+    image: chromadb/chroma:1.5.9
+    container_name: anybuddy-vector-db
+    volumes:
+      # La ruta la rellena ANSIBLE al copiar este archivo, no Compose. Sale de
+      # chroma_data_path (group_vars/all.yml), el mismo valor que se le pasa a
+      # fetch_vector_db.sh: quien llena la carpeta y quien la monta tienen que
+      # apuntar al mismo sitio o Chroma sirve un índice viejo sin avisar.
+      #
+      # No se usa ${CHROMA_DATA_PATH} porque Compose interpola desde el .env del
+      # directorio del proyecto, NO desde el env_file: de un servicio. Como acá
+      # el archivo se llama .env.prod, saldría vacía y el mount quedaría roto.
+      - "{{ chroma_data_path }}:/data"
+    # Sin ports: la consume solo api, por la red interna de Compose.
+    environment:
+      - ANONYMIZED_TELEMETRY=FALSE
+    restart: unless-stopped
+
+  api:
+    image: 176285591978.dkr.ecr.us-east-2.amazonaws.com/anybuddy-api:latest
+    container_name: anybuddy-api
+    ports:
+      # Solo loopback: el SG no tiene ingress, pero atarlo a 127.0.0.1 evita
+      # exponerlo si algún día se abre un puerto. Sirve para depurar por SSM
+      # (curl localhost:8080) sin quedar alcanzable desde afuera.
+      - "127.0.0.1:8080:8000"
+    volumes:
+      # Cache de los modelos (embedding/reranker) que la API baja de S3 en runtime.
+      # Volumen nombrado => no se re-descargan en cada reinicio ni en cada deploy.
+      - models_cache:/models
+    env_file:
+      - .env.prod
+    depends_on:
+      - vector-db
+    restart: unless-stopped
+
+  bot:
+    image: 176285591978.dkr.ecr.us-east-2.amazonaws.com/anybuddy-bot:latest
+    container_name: anybuddy-bot
+    # Sin command override: el CMD del Dockerfile ya lanza el bot.
+    env_file:
+      - .env.prod
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  models_cache:

@@ -1,0 +1,86 @@
+name: deploy-db-vector
+
+# ============================================================================
+# WORKFLOW DE DEPLOY — PLANO DEL ARTEFACTO (el indice de Chroma)
+# ============================================================================
+# Objetivo:
+#   Bajar el vector_db que la ingesta dejo en S3 y dejarlo sirviendo en el EC2.
+#
+# Toca UNICAMENTE el contenedor vector-db. api y bot no se reinician: no
+# cambiaron, y reiniciarlos cortaria el bot sin motivo.
+#
+# Es el espejo de deploy-app.yml. Los dos corren el MISMO playbook; lo unico
+# que cambia son las etiquetas de Ansible con las que se lo invoca.
+#
+# DA POR HECHO que la caja ya paso por deploy-app.yml (Docker instalado,
+# /opt/anybuddy con el compose y el .env.prod). Si no, falla con un mensaje
+# claro en vez de intentar arreglarlo a medias.
+# ============================================================================
+
+on:
+  # Se encadena a la ingesta: recien cuando hay un indice nuevo en S3 tiene
+  # sentido bajarlo. Si la ingesta fallo, no hay nada que desplegar.
+  workflow_run:
+    workflows: [ingest]
+    types: [completed]
+    branches: [main]
+
+  # A mano: re-baja el indice que ya esta en S3 sin volver a ingestar. Sirve
+  # cuando se recreo el EC2 o cuando la ingesta salio bien pero este paso no.
+  workflow_dispatch:
+
+# Mismo grupo que deploy-app e ingest. Ver el comentario largo en deploy-app.yml.
+concurrency:
+  group: ec2
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  ARTIFACTS_BUCKET: anybuddy-artifacts
+  TFSTATE_KEY: tfstate/anybuddy.tfstate
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout del repo
+        uses: actions/checkout@v4
+
+      - name: Preparar el acceso al EC2
+        id: ec2
+        uses: ./.github/actions/ec2-access
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-arn: ${{ vars.AWS_ROLE_ARN }}
+          artifacts-bucket: ${{ env.ARTIFACTS_BUCKET }}
+          tfstate-key: ${{ env.TFSTATE_KEY }}
+
+      # -----------------------------------------------------------------------
+      # Etiqueta "vector-db": bajar el indice y recrear SOLO ese contenedor.
+      #
+      # refresh_index=true no es opcional. El default es false (group_vars),
+      # porque en un deploy de codigo no hay que rebajar el indice. Aca es
+      # justo lo contrario: es el unico motivo por el que corre este workflow.
+      #
+      # No lleva ENV_PROD: el .env.prod ya esta en la caja, lo dejo el deploy
+      # de la app. Este workflow no lo reescribe.
+      # -----------------------------------------------------------------------
+      - name: Desplegar el indice nuevo
+        working-directory: infra/ansible
+        env:
+          ANSIBLE_FORCE_COLOR: "1"
+        run: |
+          ansible-playbook playbook.yml \
+            --tags vector-db \
+            -e instance_id=${{ steps.ec2.outputs.instance_id }} \
+            -e ecr_registry=${{ steps.ec2.outputs.ecr_registry }} \
+            -e refresh_index=true

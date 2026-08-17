@@ -1,0 +1,78 @@
+---
+- name: Correr la ingesta
+  hosts: anybuddy-app
+  gather_facts: true
+
+  tasks:
+    # ========================= COMPROBAR =========================
+
+    - name: Verificar que llegaron los datos de la infra
+      ansible.builtin.assert:
+        that:
+          - instance_id is defined and instance_id | length > 0
+          - ecr_registry is defined and ecr_registry | length > 0
+        fail_msg: >-
+          Faltan instance_id y/o ecr_registry. Salen de `terraform output`.
+
+    - name: Verificar que la caja ya tiene el .env.prod
+      ansible.builtin.stat:
+        path: "{{ app_dir }}/.env.prod"
+      register: env_file
+
+    # La ingesta no escribe el .env.prod, lo consume. Si no esta, es que nunca
+    # corrio el deploy en esta caja.
+    - name: Fallar si no hay .env.prod
+      ansible.builtin.assert:
+        that: env_file.stat.exists
+        fail_msg: >-
+          No existe {{ app_dir }}/.env.prod. Correr antes el workflow deploy.
+
+    # ========================== INGESTAR =========================
+
+    - name: Autenticar Docker contra ECR
+      ansible.builtin.shell:
+        cmd: >-
+          set -o pipefail &&
+          aws ecr get-login-password --region {{ aws_region }} |
+          docker login --username AWS --password-stdin {{ ecr_registry }}
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Bajar la imagen de ingestion
+      ansible.builtin.command:
+        cmd: docker pull {{ ecr_registry }}/anybuddy-ingestion:latest
+      changed_when: true
+
+    # Sin montar /data/chroma_storage a proposito: el contenedor arma el indice
+    # adentro suyo y lo sube a S3. Tocar el indice vivo del host seria escribir
+    # por debajo de Chroma mientras esta sirviendo.
+    - name: Vectorizar el knowledge base y publicarlo en S3
+      ansible.builtin.command:
+        cmd: >-
+          docker run --rm
+          --env-file {{ app_dir }}/.env.prod
+          {{ ecr_registry }}/anybuddy-ingestion:latest
+      register: ingest_run
+      changed_when: true
+
+    - name: Borrar la imagen de ingestion
+      ansible.builtin.command:
+        cmd: docker rmi {{ ecr_registry }}/anybuddy-ingestion:latest
+      changed_when: true
+      failed_when: false
+
+    # ========================== REVISAR ==========================
+
+    - name: Mostrar la salida de la ingesta
+      ansible.builtin.debug:
+        msg: "{{ ingest_run.stdout_lines }}"
+
+    - name: Leer el espacio libre en disco
+      ansible.builtin.command:
+        cmd: df -h /
+      register: disk_free
+      changed_when: false
+
+    - name: Mostrar el disco
+      ansible.builtin.debug:
+        msg: "{{ disk_free.stdout_lines }}"

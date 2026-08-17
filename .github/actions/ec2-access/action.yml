@@ -1,0 +1,119 @@
+name: Acceso al EC2
+description: >-
+  Autentica en AWS por OIDC, deja el runner listo para hablar con la caja por
+  SSM y devuelve los datos de la infra que salen del tfstate.
+
+# ============================================================================
+# POR QUE EXISTE ESTA ACCION
+# ============================================================================
+# Tres workflows entran al EC2: deploy-app, ingest y deploy-db-vector. Los tres
+# necesitan exactamente lo mismo antes de poder hacer nada (OIDC, el plugin de
+# Session Manager, Ansible, el instance_id, esperar a que SSM responda).
+#
+# Sin esto, esos ~40 lineas viven copiadas en tres archivos y hay que acordarse
+# de tocar los tres cada vez. Aca se arregla en un solo lugar.
+# ============================================================================
+
+inputs:
+  aws-region:
+    description: Region de AWS.
+    required: true
+  role-arn:
+    description: Rol que el runner asume por OIDC (sin access keys).
+    required: true
+  artifacts-bucket:
+    description: Bucket de S3 donde vive el tfstate.
+    required: true
+  tfstate-key:
+    description: Key del tfstate dentro de ese bucket.
+    required: true
+
+outputs:
+  instance_id:
+    description: Id de la EC2, leido del tfstate.
+    value: ${{ steps.infra.outputs.instance_id }}
+  ecr_registry:
+    description: Host del registry de ECR, leido del tfstate.
+    value: ${{ steps.infra.outputs.ecr_registry }}
+
+runs:
+  using: composite
+
+  steps:
+    - name: Autenticar en AWS (OIDC)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+
+    # Ansible habla con la caja por SSM, y su conector aws_ssm necesita este
+    # plugin instalado en el runner.
+    - name: Instalar session-manager-plugin
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -fsSL -o session-manager-plugin.deb \
+          "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb"
+        sudo dpkg -i session-manager-plugin.deb
+        rm -f session-manager-plugin.deb
+        session-manager-plugin --version
+
+    - name: Instalar Ansible
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 -m pip install --upgrade pip
+        python3 -m pip install ansible boto3
+        ansible-galaxy collection install amazon.aws
+        ansible --version
+
+    # El id de la instancia no se hardcodea: sale del tfstate, asi que si el
+    # EC2 se recrea los workflows siguen andando sin tocar nada en GitHub.
+    #
+    # Se baja el objeto con "aws s3 cp" en vez de usar "terraform output" a
+    # proposito: el backend S3 de Terraform necesita s3:ListBucket sobre el
+    # prefijo tfstate/ para inicializarse, y la policy del runner no lo tiene.
+    - name: Leer los datos de la infra desde el tfstate
+      id: infra
+      shell: bash
+      run: |
+        set -euo pipefail
+        aws s3 cp "s3://${{ inputs.artifacts-bucket }}/${{ inputs.tfstate-key }}" tfstate.json
+
+        INSTANCE_ID="$(jq -r '.outputs.instance_id.value' tfstate.json)"
+        ECR_REGISTRY="$(jq -r '.outputs.ecr_repository_urls.value | to_entries[0].value | split("/")[0]' tfstate.json)"
+        rm -f tfstate.json
+
+        if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "null" ]; then
+          echo "::error::No se pudo leer instance_id del tfstate. ¿Se corrio terraform apply?"
+          exit 1
+        fi
+        if [ -z "$ECR_REGISTRY" ] || [ "$ECR_REGISTRY" = "null" ]; then
+          echo "::error::No se pudo leer ecr_repository_urls del tfstate."
+          exit 1
+        fi
+
+        echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+        echo "ecr_registry=$ECR_REGISTRY" >> "$GITHUB_OUTPUT"
+        echo "Instancia $INSTANCE_ID, registry $ECR_REGISTRY"
+
+    # El agente de SSM tarda 1-2 min en registrarse despues de un arranque. Sin
+    # esta espera, una corrida hecha justo despues de recrear el EC2 falla por
+    # carrera y el error parece de permisos.
+    - name: Esperar a que la instancia responda por SSM
+      shell: bash
+      run: |
+        set -euo pipefail
+        for i in $(seq 1 30); do
+          STATUS="$(aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=${{ steps.infra.outputs.instance_id }}" \
+            --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || echo "None")"
+          if [ "$STATUS" = "Online" ]; then
+            echo "La instancia responde por SSM."
+            exit 0
+          fi
+          echo "Intento $i/30: PingStatus=$STATUS. Reintentando en 10s..."
+          sleep 10
+        done
+        echo "::error::La instancia no aparece Online en SSM despues de 5 minutos."
+        exit 1

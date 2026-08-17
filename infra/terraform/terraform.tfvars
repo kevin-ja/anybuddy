@@ -5,5 +5,6 @@ github_repo      = "kevin-ja/anybuddy"
 
 vpc_cidr           = "10.0.0.0/16"
 public_subnet_cidr = "10.0.1.0/24"
+ami_id             = "ami-02fff5bd7ef4d2855"
 instance_type      = "t3.small"
 root_volume_gb     = 20

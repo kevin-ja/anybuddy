@@ -24,6 +24,10 @@ resource "aws_instance" "app" {
     volume_type = "gp3"
   }
 
+  metadata_options {
+    http_put_response_hop_limit = 2
+  }
+
   tags = {
     Name = "${var.project}-app"
     Role = "${var.project}-app"

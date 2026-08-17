@@ -1,0 +1,12 @@
+# Config del deploy. Todo lo de aca es NO secreto y esta versionado a proposito.
+# 
+# Aqui se asignanvalores por defecto a las variables que no dependen de la infra ni de secretos.
+
+aws_region: us-east-2
+project: anybuddy
+artifacts_bucket: anybuddy-artifacts
+ssm_transfer_prefix: ansible-ssm
+app_dir: /opt/anybuddy
+chroma_data_path: /data/chroma_storage
+compose_version: v2.32.4
+refresh_index: false

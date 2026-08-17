@@ -45,15 +45,33 @@ El sistema se divide en **dos procesos** que corren en momentos distintos, pero
 
 1. **Ingesta** — batch efímero que vectoriza los documentos y publica el índice.
    Corre como contenedor *one-shot* (`docker run --rm`) **en el EC2**, disparado
-   por un cambio de artefacto en S3.
+   por el workflow `ingest.yml`.
 2. **Servicio** — los 3 contenedores permanentes que atienden a los usuarios
    (`restart: unless-stopped`). Corren en **el mismo EC2**.
 
 - El handoff entre ambos es **S3** (buzón de artefactos, versionado recomendado).
-- La regla mental que gobierna todo: **código = build; artefacto = run.**
-  Cambiar *código* dispara un **build de imágenes Docker** (GitHub Actions → ECR); cambiar
-  un *artefacto* (dato/modelo en S3) dispara un **run** de la imagen ya construida
-  (evento S3 → EC2). Al cambiar un artefacto **no se compila nada**.
+- La regla mental que gobierna todo: **api y bot son estado; la ingesta es un evento.**
+  api y bot son servicios permanentes: desplegarlos es dejarlos *corriendo con la imagen
+  nueva*, y a ese estado `docker compose up -d` llega solo. La ingesta arranca, trabaja y
+  muere: no hay contenedor que corregir, así que **una imagen nueva no ejecuta nada**. Hay
+  que correrla para que produzca el `vector_db`.
+- De ahí la asimetría del pipeline: el plano de la app tiene **build → deploy**, y el plano
+  del artefacto tiene **build → run → deploy**, con un paso en el medio que ningún
+  `up -d` puede deducir.
+
+> **Cómo se mapea con el pipeline.** Este documento describe los dos **procesos**; el
+> [`README.md`](README.md) los opera con **cinco workflows**. La equivalencia:
+>
+> | Este doc | Workflow | Qué produce |
+> |---|---|---|
+> | Build de api y bot | `build-app.yml` | imágenes en ECR |
+> | Servicio (§3) | `deploy-app.yml` | api y bot en la versión nueva |
+> | Build de la ingesta | `build-ingest.yml` | imagen en ECR — **no ejecuta nada** |
+> | Ingesta (§2) | `ingest.yml` | índice en S3 `vector_db/` |
+> | `fetch` + recreate (§3) | `deploy-db-vector.yml` | Chroma con el índice nuevo |
+>
+> O sea: la **ingesta es el "build" del plano de artefactos** (entrada cruda → artefacto
+> compilado) y S3 `vector_db/` es su registro, igual que ECR lo es para las imágenes.
 
 ---
 
@@ -63,9 +81,11 @@ El sistema se divide en **dos procesos** que corren en momentos distintos, pero
 flowchart TB
     subgraph BUILD_PLANE["PLANO DE BUILD — CÓDIGO cambia (GitHub Actions · efímero)"]
         direction TB
-        TRG0["Disparador:<br/>push de código"]
-        GHA["Runner efímero:<br/>build docker images (api + bot + ingestion)<br/>→ push a ECR"]
+        TRG0["push a main"]
+        GHA["build-app.yml:<br/>construye SOLO api y/o bot<br/>→ push a ECR"]
+        GHB["build-ingest.yml:<br/>construye la imagen de ingesta<br/>→ push a ECR"]
         TRG0 --> GHA
+        TRG0 --> GHB
     end
 
     subgraph AWS_STORAGE["Almacenamiento (AWS · bucket ÚNICO anybuddy-artifacts)"]
@@ -74,29 +94,37 @@ flowchart TB
         S3[("S3: anybuddy-artifacts (versionado recomendado)<br/>knowledge_base/faqs.txt<br/>models/embedding_model.tar.gz<br/>vector_db/chroma_storage.tar.gz")]
     end
 
-    subgraph RUN_PLANE["PLANO DE RUN — ARTEFACTO cambia (1 EC2 · always-on)"]
+    subgraph RUN_PLANE["PLANO DE RUN — 1 EC2 · always-on"]
         direction TB
-        TRG1["Disparador:<br/>evento S3 (ObjectCreated) en<br/>knowledge_base/ o models/"]
-        EVT["EventBridge → SSM RunCommand<br/>(sin Lambda; tentativo)"]
-        EC2["EC2:<br/>1. corre imagen INGESTA (--rm) → vector_db → S3<br/>2. fetch_vector_db.sh (baja vector_db)<br/>3. docker compose pull + recrea los contenedores (chroma, api, bot)"]
-        TRG1 --> EVT --> EC2
+        TRG1["ingest.yml<br/>(tras build-ingest, o a mano si cambió el faqs.txt)"]
+        EVT["GHA runner → Ansible por SSM<br/>(playbook infra/ansible/ingest.yml)"]
+        EC2["EC2: corre imagen INGESTA (--rm)<br/>→ vector_db → S3"]
+        TRG2["deploy-db-vector.yml:<br/>playbook.yml --tags vector-db -e refresh_index=true"]
+        TRG3["deploy-app.yml:<br/>playbook.yml --tags bootstrap,app"]
+        EC2B["EC2: docker compose → chroma · api · bot sirviendo"]
+        TRG1 --> EVT --> EC2 --> TRG2 --> EC2B
+        TRG3 --> EC2B
     end
 
     EXT["Discord<br/>(~20 alumnos activos)"]
     OAI["OpenAI API"]
 
     GHA -- "push imágenes" --> ECR
-    ECR -- "docker pull (instance profile)" --> EC2
+    GHB -- "push imagen" --> ECR
+    GHA -. "workflow_run" .-> TRG3
+    GHB -. "workflow_run" .-> TRG1
+    ECR -- "docker pull (instance profile)" --> EC2B
     S3 -- "lee knowledge_base/ + models/" --> EC2
     EC2 -- "escribe vector_db/" --> S3
-    EC2 <-- "RAG / LLM" --> OAI
-    EC2 <-- "WebSocket saliente" --> EXT
+    S3 -- "baja vector_db/" --> EC2B
+    EC2B <-- "RAG / LLM" --> OAI
+    EC2B <-- "WebSocket saliente" --> EXT
 
     classDef ci fill:#e8f0fe,stroke:#4285f4,color:#000
     classDef store fill:#fff4e5,stroke:#f5a623,color:#000
     classDef ext fill:#eafaf1,stroke:#27ae60,color:#000
-    class BUILD_PLANE,GHA ci
-    class RUN_PLANE,EVT,EC2 ci
+    class BUILD_PLANE,GHA,GHB ci
+    class RUN_PLANE,EVT,EC2,EC2B ci
     class ECR,S3,AWS_STORAGE store
     class EXT,OAI ext
 ```
@@ -106,26 +134,37 @@ flowchart TB
 ## 2. Proceso 1 — Ingesta (detalle)
 
 Corre como **contenedor efímero en el EC2** (`docker run --rm` de la imagen
-`anybuddy-ingestion` bajada de ECR). **No** corre en GitHub Actions: bajo el
-modelo "código = build; artefacto = run", GitHub Actions solo construye
-imágenes; la ingesta es un *run* de artefacto y sucede en el EC2.
+`anybuddy-ingestion` bajada de ECR). **No** corre en GitHub Actions: el runner
+solo construye imágenes y da la orden; el trabajo pesado —modelo de embeddings
+en RAM, vectorización de 15-20 min— sucede en el EC2.
 
 ### flujo
 
 * El conocimiento fuente y el modelo de embedding viven en el bucket único
     anybuddy-artifacts (prefijos knowledge_base/ y models/).
-* Cuando se agrega o modifica un artefacto, S3 genera un evento ObjectCreated.
-* EventBridge (filtrado a los prefijos knowledge_base/ y models/) reacciona
-    y ejecuta un SSM RunCommand contra el EC2. (Se descartó Lambda salvo que se
-    necesite lógica condicional; decisión tentativa: sin Lambda.)
+* El disparador es **mixto**, el workflow `ingest.yml`:
+    **automático** cuando `build-ingest.yml` publica una imagen nueva (cambió el código de
+    la ingesta), y **manual** (`workflow_dispatch`) cuando cambió el `faqs.txt`.
+* El runner de GHA no hace el trabajo, solo lo ordena: entra por SSM con Ansible
+    y lanza el contenedor en el EC2.
 * El EC2 corre la imagen de ingesta one-shot: chunking, embeddings e
     indexación con Chroma, y sube el índice comprimido a S3 (vector_db/).
+* Al terminar encadena `deploy-db-vector.yml`, que corre `playbook.yml --tags vector-db`
+    con `refresh_index=true`: baja el índice y recrea **solo** el contenedor `vector-db`.
 
 Flujo completo
 
 ```
-[S3: knowledge_base/ o models/] -(evento ObjectCreated)-> [EventBridge (filtro por prefijo)] -(RunCommand)-> [SSM] -(envía comando)-> [EC2] -(docker run --rm anybuddy-ingestion: chunking, embeddings, indexación Chroma)-> [vector_db: chroma_storage.tar.gz] -(subir)-> [S3: vector_db/] -(fetch + recrea)-> [Contenedores: chroma, api, bot]
+[build-ingest.yml, o Run workflow a mano] -> [ingest.yml: GHA runner] -(Ansible por SSM)-> [EC2] -(docker run --rm anybuddy-ingestion: chunking, embeddings, indexación Chroma)-> [vector_db: chroma_storage.tar.gz] -(subir)-> [S3: vector_db/] -(deploy-db-vector.yml)-> [vector-db recreado]
 ```
+
+> **Por qué el disparo es mixto.** Son dos situaciones distintas. Cuando cambia el
+> **código**, el sistema ya sabe que cambió: el push lo disparó, `build-ingest.yml` lo
+> construyó, y encadenar sale gratis. Sin eso, la imagen nueva se queda en ECR sin
+> ejecutarse y el bot sigue respondiendo con un índice que produjo el código viejo.
+> Cuando cambia el **`faqs.txt`**, el que se entera es una persona que va a entrar igual a
+> subir el archivo; un botón con log, historial y reintento cuesta menos que escuchar
+> eventos de S3 para deducir algo que el humano ya sabía.
 
 > **Nota — Quality gate (deepeval): recomendado, aún NO incorporado.**
 > El plan contempla un gate de calidad con `deepeval` que valide el índice
@@ -144,14 +183,37 @@ Flujo completo
 `docker compose` (con `docker-compose.prod.yml`, que usa `image:` de ECR en vez
 de `build:`).
 
+Quién pone todo eso ahí: **Ansible**. Terraform entrega la caja pelada —esa es la
+frontera— y el playbook la deja sirviendo: instala Docker y el plugin de compose, escribe
+el `.env.prod` (que llega como el secret `ENV_PROD` del repo), hace login en ECR y levanta
+los contenedores. El playbook es **idempotente**, así que bootstrap y deploy son la misma
+corrida: la primera vez instala todo, las siguientes traen de ECR la imagen publicada y
+recrean los contenedores si cambió.
+
+Es **un solo playbook para los dos deploys**, separados por tags de Ansible:
+`--tags bootstrap,app` lo invoca `deploy-app.yml`; `--tags vector-db` lo invoca
+`deploy-db-vector.yml` y toca únicamente el contenedor de Chroma. Se hizo con tags y no con
+dos playbooks para no duplicar el bloque de bootstrap. **`deploy-app.yml` es el que hace el
+bootstrap**, así que es el que tiene que correr primero en una caja recién creada.
+
+> **Ansible entra por SSM, no por SSH.** El conector `aws_ssm` usa el mismo canal por
+> el que ya se administra la caja. Eso mantiene el SG sin un solo puerto de entrada y
+> evita guardar una clave `.pem` en GitHub Secrets — que sería reintroducir por la
+> ventana la credencial de larga vida que todo el diseño evita. El runner se autentica
+> con OIDC igual que para el build.
+>
+> Detalle que sorprende: una sesión SSM es una *terminal*, no un canal de ficheros. Para
+> copiar archivos, Ansible los sube al prefijo `ansible-ssm/` del bucket y la instancia
+> los baja de ahí. Por eso ese permiso de S3 aparece en las **dos** identidades.
+
 ```mermaid
 flowchart TB
     subgraph GHA["GitHub Actions (build — CÓDIGO cambia)"]
-        BUILD["runner efímero:<br/>build docker images (api + bot + ingestion)"]
+        BUILD["build-app.yml → api, bot<br/>build-ingest.yml → ingestion"]
     end
 
-    subgraph TRIG["Disparo del deploy (ARTEFACTO cambia)"]
-        SSM["EventBridge → SSM send-command"]
+    subgraph TRIG["Disparo del deploy (dos orígenes)"]
+        SSM["APP: deploy-app.yml → playbook --tags bootstrap,app<br/>INGESTA: ingest.yml → corre la imagen<br/>ÍNDICE: deploy-db-vector.yml → mismo playbook --tags vector-db"]
     end
 
     ECR[("ECR<br/>anybuddy-{api,bot,ingestion}:&lt;tag&gt;")]
@@ -160,7 +222,7 @@ flowchart TB
 
     subgraph EC2["EC2 (t3.small) — subred pública, SIN inbound"]
         direction TB
-        AGENT["SSM Agent:<br/>fetch_vector_db.sh → /data<br/>docker compose pull + recrea los contenedores<br/>(NUNCA build)"]
+        AGENT["SSM Agent:<br/>Ansible: docker + login ECR + .env.prod<br/>fetch_vector_db.sh → /data<br/>docker compose pull + recrea los contenedores<br/>(NUNCA build)"]
 
         subgraph DC["docker compose — 3 contenedores"]
             direction LR
@@ -210,16 +272,20 @@ flowchart TB
 | **api** (FastAPI) | contenedor en el **EC2** | HTTP con Chroma y con el bot; llama a OpenAI |
 | **bot** (discord.py) | contenedor en el **EC2** | HTTP a la API; WebSocket **saliente** a Discord |
 | **Imágenes** (api/bot/ingestion) | **ECR** `anybuddy-{api,bot,ingestion}` | el EC2 hace `pull` con su instance profile |
-| **Secretos** | **`.env.prod`** en el EC2 | inyectados a los contenedores en runtime |
+| **Secretos** | secret `ENV_PROD` del repo (el `.env.prod` completo) → **`.env.prod`** en el EC2 (`0600`) | Ansible lo escribe en el deploy de la app; se inyecta a los contenedores en runtime |
+| **Playbooks** | `infra/ansible/` en el repo (`playbook.yml` con tags + `ingest.yml`) | los corre el runner de GitHub, contra el EC2 por SSM |
+| **Infraestructura** | `infra/terraform/` en el repo, estado en S3 | `terraform apply`, a mano |
 
 ---
 
 ## 5. Las 3 ideas clave
 
-1. **Código = build; artefacto = run.** Cambiar código dispara un *build* de
-   imágenes en GitHub Actions (→ ECR); cambiar un artefacto en S3 dispara un *run*
-   de la imagen ya construida (evento S3 → EventBridge → SSM → EC2). El EC2 **nunca
-   ve el código fuente**: solo baja imágenes ya hechas de ECR.
+1. **Una imagen nueva es una receta nueva, no un plato cocinado.** Para api y bot esas dos
+   cosas coinciden, porque la imagen *es* lo que se sirve: `compose up -d` la despliega y
+   listo. Para la ingesta no: su producto es el `vector_db` en S3, así que entre la imagen y
+   el resultado hay una **ejecución** que ningún `up -d` puede deducir. De ahí que su plano
+   tenga un workflow de más (`ingest.yml`). El EC2 **nunca ve el código fuente**: solo baja
+   imágenes ya hechas de ECR.
 
    > **Por qué el build NO corre en el EC2** (la pregunta que siempre vuelve).
    > La intuición de "compilar en la misma caja" viene de local, donde
@@ -293,7 +359,7 @@ graph TD
     classDef storage fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
     classDef gate fill:#ffebee,stroke:#c62828,stroke-width:2px;
 
-    Source["S3: knowledge_base / models"] --> Trigger["Evento S3 → EventBridge → SSM"]
+    Source["S3: knowledge_base / models"] --> Trigger["ingest.yml (manual) → Ansible por SSM"]
     Trigger --> Runner["EC2: docker run --rm ingestion"]
 
     subgraph Procesamiento
