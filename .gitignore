@@ -19,6 +19,12 @@ pipelines/ingestion/knowledge_base/
 # otros
 handsoff.md
 
+# Herramientas locales del editor/asistente: no son parte del proyecto
+.claude/
+**/.claude/
+CLAUDE.md
+**/CLAUDE.md
+
 # Terraform
 **/.terraform/
 *.tfstate
