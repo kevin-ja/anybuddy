@@ -43,6 +43,20 @@
         cmd: docker pull {{ ecr_registry }}/anybuddy-ingestion:latest
       changed_when: true
 
+    # Un contenedor de ingesta puede sobrevivir al workflow que lo lanzo: lo
+    # maneja dockerd, no la sesion SSM, asi que si el job se corta el cliente
+    # muere y el contenedor sigue. En una caja de 2 GB eso la deja sin aire y
+    # hasta tumba al agente de SSM (paso el 17/08).
+    #
+    # Por eso el contenedor va con --name: sin nombre no hay forma de
+    # encontrarlo despues. Esto lo mata antes de arrancar el nuevo.
+    - name: Matar una ingesta huerfana de una corrida anterior
+      ansible.builtin.command:
+        cmd: docker rm -f {{ ingest_container }}
+      register: orphan_kill
+      changed_when: orphan_kill.rc == 0
+      failed_when: false
+
     # Sin montar /data/chroma_storage a proposito: el contenedor arma el indice
     # adentro suyo y lo sube a S3. Tocar el indice vivo del host seria escribir
     # por debajo de Chroma mientras esta sirviendo.
@@ -58,7 +72,7 @@
     - name: Vectorizar el knowledge base y publicarlo en S3
       ansible.builtin.command:
         cmd: >-
-          docker run --rm
+          docker run --rm --name {{ ingest_container }}
           --env-file {{ app_dir }}/.env.prod
           {{ ecr_registry }}/anybuddy-ingestion:latest
       register: ingest_run
