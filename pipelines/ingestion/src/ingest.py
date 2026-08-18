@@ -8,6 +8,8 @@ VECTOR_DATABASE_PATH = settings.vector_db_path
 
 CHROMA_COLLECTION_NAME = settings.chroma_collection_name
 
+# Chroma graba estos parámetros CUANDO CREA la colección. Cambiarlos no
+# reindexa una que ya existe: hay que construir el índice desde cero.
 HNSW_CONFIG = {
     "hnsw:space": settings.hnsw_space,
     "hnsw:M": settings.hnsw_m,
@@ -102,12 +104,16 @@ def run_ingestion():
     text = inputs.knowledge_path.read_text(encoding="utf-8")
 
     print("🧠 Ejecutando el Chunking Inteligente Nativo...")
+    # A diferencia del HNSW, estos dos están fijos acá y no en settings:
+    # tocarlos cambia el índice entero.
     chunks = smart_recursive_splitter(text, chunk_size=500, chunk_overlap=50)
 
     print("🧠 Cargando el modelo de embedding...")
     model = SentenceTransformer(inputs.model_ref)
 
     print(f"🧬 Generando vectores para {len(chunks)} fragmentos...")
+    # Todos los chunks entran al modelo de una sola vez: el pico de memoria
+    # crece con el faqs.txt. Primer sospechoso si la ingesta falla salteado.
     embeddings = model.encode(chunks, convert_to_numpy=True).tolist()
 
     # Creación de la DB Vectorial con ChromaDB ---------------------------------------------
@@ -121,6 +127,8 @@ def run_ingestion():
         metadata=HNSW_CONFIG,
     )
 
+    # Los ids son chunk_0..N y esto es add(), no upsert: sale bien solo porque
+    # el contenedor arranca siempre con chroma_storage vacío.
     ids = [f"chunk_{i}" for i in range(len(chunks))]
     collection.add(ids=ids, embeddings=embeddings, documents=chunks)
 
