@@ -12,7 +12,7 @@ logger = logging.getLogger("AnyBuddyBot")
 DISCORD_BOT_TOKEN = settings.discord_bot_token
 FASTAPI_URL = settings.fastapi_url
 ALLOWED_CHANNELS = [
-    user.strip() for user in settings.allowed_channels.split(",") if user.strip()
+    canal.strip() for canal in settings.allowed_channels.split(",") if canal.strip()
 ]
 
 
