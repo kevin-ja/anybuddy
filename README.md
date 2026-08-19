@@ -8,7 +8,7 @@ el diagrama: **api y bot son estado; la ingesta es un evento.**
 - **api y bot** son servicios permanentes. Desplegarlos significa dejarlos *corriendo con
   la imagen nueva*. Eso es un **estado deseado**, y `docker compose up -d` sabe llegar solo:
   compara la imagen del contenedor con la que acaba de bajar, ve que cambió y lo recrea.
-- **La ingesta** arranca, trabaja ~20 min y muere. No hay ningún contenedor suyo corriendo
+- **La ingesta** arranca, trabaja un par de minutos y muere. No hay ningún contenedor suyo corriendo
   que haya que corregir, así que `up -d` no tiene nada que comparar ni nada que hacer. Su
   producto no es un contenedor: es el `vector_db` que queda en S3.
 
@@ -198,16 +198,16 @@ build-app termina primero
                            (la caja, sola para él)
 
 build-ingest termina
- └──► ingest.yml ──► corre en el runner, EN PARALELO, ~20 min
+ └──► ingest.yml ──► corre en el runner, EN PARALELO, ~2 min
                           │           (no pide "ec2": no entra a la caja)
                           ▼
                   deploy-db-vector.yml ──► toma "ec2" ──► índice nuevo
 ```
 
 Sale en el orden correcto —**app primero, ingesta después, índice al final**— sin haberlo
-forzado. Y desde que la ingesta corre en el runner, ni siquiera hace falta esperarla: los
-20 minutos de vectorizado se solapan con el deploy de la app en vez de ir detrás. El único
-que hace fila es `deploy-db-vector`, y para cuando llega la caja ya está libre.
+forzado. Y desde que la ingesta corre en el runner, ni siquiera hace falta esperarla: el
+vectorizado se solapa con el deploy de la app en vez de ir detrás. El único que hace fila
+es `deploy-db-vector`, y para cuando llega la caja ya está libre.
 
 Y lo importante: si `build-ingest` o la ingesta fallan, **el deploy de api y bot ya
 ocurrió**. Ese acoplamiento es justamente lo que la separación en dos planos elimina.

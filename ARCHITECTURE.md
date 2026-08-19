@@ -149,8 +149,12 @@ flowchart TB
 
 Corre como **contenedor efímero en el runner de GitHub Actions** (`docker run --rm` de
 la imagen `anybuddy-ingestion` bajada de ECR). El EC2 **no participa**: el trabajo
-pesado —modelo de embeddings en RAM, vectorización de 15-20 min— sucede en el runner,
-que tiene 16 GB para él solo, y la caja de producción sigue atendiendo sin enterarse.
+pesado —modelo de embeddings en RAM, vectorización— sucede en el runner, que tiene la
+máquina para él solo, y la caja de producción sigue atendiendo sin enterarse.
+
+Medido el 19/08: **1m53s en el runner contra 16m23s en el EC2**, con el mismo `faqs.txt` y
+la misma imagen. La diferencia no es el CPU: en la caja, vectorizar peleaba por 2 GB de RAM
+contra Chroma, la api y el bot.
 
 ### flujo
 
