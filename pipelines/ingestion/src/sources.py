@@ -64,6 +64,11 @@ def _resolve_knowledge(settings: Settings) -> Path:
     if not settings.s3_bucket:
         raise SystemExit("❌ APP_ENV=production requiere S3_BUCKET")
 
+    # El faqs.txt NO viaja adentro de la imagen: se baja de S3 en cada corrida.
+    # Por eso cambiar el knowledge base no necesita reconstruir nada, solo volver
+    # a ejecutar la ingesta. Y por eso knowledge_base/ esta en .gitignore: la
+    # copia del repo es para trabajar en local, la fuente de verdad es S3, que
+    # ademas esta versionado.
     settings.knowledge_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"📥 S3 → {settings.knowledge_s3_key}")
     get_s3_client(settings.aws_region).download_file(

@@ -24,6 +24,10 @@ if not DISCORD_BOT_TOKEN:
 # =====================================================================
 intents = discord.Intents.default()
 intents.messages = True
+# message_content es un intent PRIVILEGIADO: activarlo aca no alcanza, tambien
+# hay que habilitarlo en el Developer Portal de Discord. Si falta de ese lado el
+# bot se conecta igual y aparece online, pero todos los mensajes le llegan con
+# content vacio, asi que contesta cualquier cosa sin dar un solo error.
 intents.message_content = True
 
 client = discord.Client(intents=intents)
@@ -47,6 +51,11 @@ async def on_message(message: discord.Message):
         return
 
     # 2. Filtro de Canales (Allow-list): Solo procesar si el canal actual está en la lista
+    #
+    # La lista es de NOMBRES, no de ids. Renombrar el canal en Discord deja al
+    # bot mudo sin tocar nada del deploy: sigue online, lee los mensajes y los
+    # descarta aca. Los ids no cambian nunca, pero se eligio el nombre porque
+    # ALLOWED_CHANNELS lo escribe una persona en el .env.prod.
     if message.channel.name not in ALLOWED_CHANNELS:
         return
 
