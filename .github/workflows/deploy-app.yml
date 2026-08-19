@@ -66,15 +66,74 @@ env:
   TFSTATE_KEY: tfstate/anybuddy.tfstate
 
 jobs:
+  # =========================================================================
+  # HAY IMAGEN NUEVA?
+  # =========================================================================
+  # workflow_run avisa que build-app TERMINO, no que haya construido algo. Y
+  # build-app corre por cambios que no producen imagen: sus paths incluyen
+  # .github/actions/ec2-access/** y el propio build-app.yml. En ese caso el job
+  # changes arma una matriz vacia, el job build queda skipped y el workflow
+  # igual termina en success. Sin este guard, un comentario en la accion
+  # disparaba un deploy entero (paso el 19/08).
+  #
+  # Como se sabe: se le preguntan los jobs de la corrida que disparo esta a la
+  # API. Los outputs de un workflow_run no viajan en el evento, los jobs si.
+  # Los del build se llaman "build (api, ...)" y "build (bot, ...)" por la
+  # matriz, o "build" a secas cuando quedo skipped: alcanza con buscar alguno
+  # que empiece con "build" y haya terminado en success.
+  # =========================================================================
+  guard:
+    runs-on: ubuntu-latest
+
+    permissions:
+      # Para leer los jobs de la corrida que disparo esta. Nada mas.
+      actions: read
+
+    outputs:
+      deploy: ${{ steps.check.outputs.deploy }}
+
+    steps:
+      - name: Ver si build-app construyo alguna imagen
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          # A mano no hay build previo que mirar: es el boton de "desplegar lo
+          # que ya esta en ECR", util para recrear la caja sin tocar codigo.
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            echo "Lanzado a mano: se despliega."
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Si el build fallo o fue cancelado, no hay imagenes nuevas.
+          if [ "$CONCLUSION" != "success" ]; then
+            echo "build-app termino en '$CONCLUSION': no se despliega."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BUILT="$(gh api "/repos/${{ github.repository }}/actions/runs/$RUN_ID/jobs"             --paginate             --jq '[.jobs[] | select(.name | startswith("build")) | .conclusion]
+                  | any(. == "success")')"
+
+          if [ "$BUILT" = "true" ]; then
+            echo "build-app publico imagenes nuevas: se despliega."
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build-app no construyo nada (matriz vacia): no se despliega."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          fi
+
   deploy:
     runs-on: ubuntu-latest
 
-    # Si el build fallo o fue cancelado, no hay imagenes nuevas que desplegar.
-    # workflow_run se dispara igual cuando el build termina MAL, asi que el
-    # filtro va aca. En workflow_dispatch no hay build previo que mirar.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+    needs: guard
+    if: needs.guard.outputs.deploy == 'true'
 
     permissions:
       # Para autenticarse con AWS por OIDC, sin access keys.

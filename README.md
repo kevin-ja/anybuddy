@@ -92,6 +92,8 @@ build-app.yml (Github Actions)
    │
    ▼
 deploy-app.yml (Ansible)
+   ├─ job guard    → ¿build-app construyó algo, o solo terminó bien?
+   │                 si la matriz salió vacía, corta acá y no despliega
    ├─ toma el grupo de concurrencia "ec2" (si hay algo corriendo, espera)
    ├─ acción ec2-access: OIDC · instala SSM plugin + Ansible
    │                     lee instance_id y ecr_registry del tfstate
@@ -153,6 +155,13 @@ propósito (sería escribir por debajo de Chroma mientras está sirviendo), y el
 del contenedor quedó enganchado a la vieja.
 
 **`deploy-app.yml` no corre**: escucha a `build-app`, que no arrancó.
+
+> **Por qué `deploy-app` mira si se construyó algo.** `build-app` también arranca por
+> cambios que no producen imagen —sus `paths` incluyen la acción `ec2-access` y el propio
+> `build-app.yml`—, y en ese caso la matriz sale vacía, el job `build` queda en `skipped` y
+> el workflow **igual termina en `success`**. Como `workflow_run` solo avisa que el otro
+> terminó, sin el `guard` un comentario en un `.yml` disparaba un deploy entero. Pasó el
+> 19/08.
 
 ---
 
