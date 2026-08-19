@@ -26,8 +26,22 @@ STAGING="${CHROMA_DATA_PATH}.new"
 rm -rf "$STAGING"
 mkdir -p "$STAGING"
 
-# Descomprime el archivo descargado en esa carpeta temporal.
-tar -xzf "$TMP_TAR" -C "$STAGING"
+# --strip-components=1 porque el .tar.gz trae una carpeta de primer nivel
+# (compress_dir lo arma con arcname=chroma_storage). Sin esto queda anidado en
+# $CHROMA_DATA_PATH/chroma_storage/ y Chroma NO encuentra la base.
+tar -xzf "$TMP_TAR" -C "$STAGING" --strip-components=1
+
+# Chroma no avisa cuando la carpeta que monta no tiene base: crea una vacía y
+# arranca igual, sirviendo cero documentos con todos los logs en verde. Eso
+# pasó el 19/08 y costó una tarde encontrarlo. Se comprueba acá, que es el
+# último punto donde todavía se puede fallar con un mensaje claro.
+if [ ! -f "$STAGING/chroma.sqlite3" ]; then
+  echo "❌ El índice extraído no tiene chroma.sqlite3 en la raíz de $STAGING."
+  echo "   Esto es lo que sí trajo:"
+  ls -la "$STAGING"
+  exit 1
+fi
+
 rm -rf "${CHROMA_DATA_PATH}.old"
 
 # Si ya existe una base de datos, la renombra como respaldo (.old).

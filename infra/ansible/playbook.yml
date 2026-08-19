@@ -111,12 +111,15 @@
       register: compose_file
       tags: [bootstrap]
 
+    # Tambien en vector-db, no solo en bootstrap: deploy-db-vector.yml corre este
+    # script, asi que tiene que poder actualizarlo. Con el tag suelto, arreglar
+    # el script no llegaba nunca a la caja por esa via.
     - name: Copiar fetch_vector_db.sh
       ansible.builtin.copy:
         src: files/fetch_vector_db.sh
         dest: "{{ app_dir }}/fetch_vector_db.sh"
         mode: "0755"
-      tags: [bootstrap]
+      tags: [bootstrap, vector-db]
 
     - name: Escribir el .env.prod
       ansible.builtin.copy:
