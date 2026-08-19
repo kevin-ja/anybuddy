@@ -6,7 +6,6 @@ aws_region: us-east-2
 project: anybuddy
 artifacts_bucket: anybuddy-artifacts
 app_dir: /opt/anybuddy
-ingest_container: anybuddy-ingest
 chroma_data_path: /data/chroma_storage
 compose_version: v2.32.4
 refresh_index: false

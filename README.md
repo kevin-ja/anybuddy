@@ -39,7 +39,7 @@ Para la ingesta hay un paso en el medio que ningún `up -d` puede deducir:
         ▼                                                └────────┬────────┘
    deploy-app.yml                                                 ▼
    pull + up -d                                             ingest.yml
-   + bootstrap de la caja                          EC2 · docker run --rm
+   + bootstrap de la caja                    runner de GHA · docker run --rm
         │                                          chunking, embeddings
         ▼                                                        │
    api · bot en la                                               ▼
@@ -54,9 +54,12 @@ Para la ingesta hay un paso en el medio que ningún `up -d` puede deducir:
                                                         vector-db con el
                                                         índice nuevo
 
-   Los tres workflows que entran al EC2 (deploy-app, ingest, deploy-db-vector)
+   Los dos workflows que entran al EC2 (deploy-app y deploy-db-vector)
    comparten el grupo de concurrencia "ec2": hacen fila, nunca se pisan.
    Siempre por SSM, sin SSH y sin puertos de entrada.
+
+   ingest.yml NO entra: corre el contenedor en el propio runner de GitHub.
+   La caja tiene 2 GB y la ingesta no cabía ahí junto a api, bot y Chroma.
 ```
 
 
@@ -119,17 +122,18 @@ Si hubo cambios en pipelines/ingestion/
    └─ se crea la imagen de ingest
    │
    ▼ 
-[ingest.yml] (GitHub actions & Ansible)
-   ├─ Crea la BD vectorial/indice (usa ec2) y lo sube a S3 bucket
-   └─ ansible-playbook ingest.yml
-        · comprueba que existe /opt/anybuddy/.env.prod
-          (si no, falla pidiendo deploy-app: la ingesta lo consume, no lo escribe)
-        · docker pull anybuddy-ingestion:latest
+[ingest.yml] (GitHub actions)
+   ├─ Crea la BD vectorial/índice EN EL RUNNER y la sube al bucket de S3
+   └─ el EC2 no se toca en todo el paso
+        · escribe el .env.prod del secret ENV_PROD (el runner nace limpio)
+        · docker pull anybuddy-ingestion:latest   ← el mismo ECR de siempre
         · docker run --rm --env-file .env.prod   ← SIN montar /data/chroma_storage
+             + las credenciales de AWS por -e: dentro de un contenedor en el
+               runner no hay rol de instancia que boto3 pueda descubrir solo
              baja faqs.txt y el modelo de embeddings de S3
              chunking + embeddings → arma Chroma DENTRO del contenedor
              APP_ENV=production → comprime y sube a s3://…/vector_db/
-        · docker rmi   (libera varios GB de los 20 del disco)
+        · el disco del runner se tira a la basura al terminar el job
    │
    ▼
 [deploy-db-vector.yml] (Ansible)
@@ -181,20 +185,20 @@ push
  └──► build-ingest.yml   ~15 min
         │
 build-app termina primero
- └──► deploy-app.yml ────► toma "ec2" ─── despliega api/bot ──┐
-                                                              │
-build-ingest termina                                          │
- └──► ingest.yml ──► pide "ec2" ──► ESPERA ◄──────────────────┘
-                          │
-                          ▼ (deploy-app soltó el grupo)
-                     corre la ingesta, ~20 min
-                          │
+ └──► deploy-app.yml ────► toma "ec2" ─── despliega api/bot
+                           (la caja, sola para él)
+
+build-ingest termina
+ └──► ingest.yml ──► corre en el runner, EN PARALELO, ~20 min
+                          │           (no pide "ec2": no entra a la caja)
                           ▼
                   deploy-db-vector.yml ──► toma "ec2" ──► índice nuevo
 ```
 
 Sale en el orden correcto —**app primero, ingesta después, índice al final**— sin haberlo
-forzado: pasa solo porque el build de la app es más rápido y la fila lo respeta.
+forzado. Y desde que la ingesta corre en el runner, ni siquiera hace falta esperarla: los
+20 minutos de vectorizado se solapan con el deploy de la app en vez de ir detrás. El único
+que hace fila es `deploy-db-vector`, y para cuando llega la caja ya está libre.
 
 Y lo importante: si `build-ingest` o la ingesta fallan, **el deploy de api y bot ya
 ocurrió**. Ese acoplamiento es justamente lo que la separación en dos planos elimina.

@@ -37,13 +37,17 @@ on:
 # ============================================================================
 # CONCURRENCIA
 # ============================================================================
-# Grupo "ec2", COMPARTIDO con ingest.yml y deploy-db-vector.yml.
+# Grupo "ec2", COMPARTIDO con deploy-db-vector.yml.
 #
-# Son tres workflows que entran a la misma caja, y es un t3.small con 2 GB de
-# RAM y 20 GB de disco. Dos de ellos a la vez se pisan los archivos de
-# /opt/anybuddy, y una ingesta corriendo mientras se baja una imagen de 6.5 GB
-# es la forma mas facil de quedarse sin disco o sin memoria. Con un solo grupo
-# hacen fila en vez de chocar.
+# Son dos workflows que entran a la misma caja, y es un t3.small con 2 GB de
+# RAM y 20 GB de disco. Los dos a la vez se pisan los archivos de
+# /opt/anybuddy: uno reescribe el .env.prod mientras el otro recrea un
+# contenedor que lo esta leyendo. Con un solo grupo hacen fila en vez de
+# chocar.
+#
+# ingest.yml estaba en este grupo hasta el 19/08. Salio cuando la ingesta se
+# mudo al runner de GitHub: dejo de entrar a la caja, asi que esperar aca solo
+# la demoraba.
 #
 # cancel-in-progress FALSE a proposito: cancelar un deploy a mitad de camino
 # deja la caja a medio configurar (p.ej. el .env.prod nuevo escrito pero los

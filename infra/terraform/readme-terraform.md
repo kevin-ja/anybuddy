@@ -136,8 +136,13 @@ van separadas:
 **federación OIDC** (token temporal, cero access keys guardadas en GitHub), y su *trust policy*
 está limitada a tu repo (`repo:kevin-ja/anybuddy:*`). Lleva dos políticas:
 - `anybuddy-gha-build-ecr` — **push a los 3 repos** y nada más. Los ARN llegan del módulo `ecr`.
-- `anybuddy-gha-deploy` — lo que Ansible necesita para entrar:
+- `anybuddy-gha-deploy` — lo que Ansible necesita para entrar, más lo que la ingesta
+  necesita para trabajar:
   - `s3:GetObject` sobre el **tfstate**, para leer los outputs;
+  - `s3:GetObject` sobre `knowledge_base/` y `models/`, y `s3:PutObject` sobre
+    `vector_db/`: desde el 19/08 la ingesta corre en el runner, así que las mismas
+    lecturas y escrituras que antes hacía el rol del EC2 ahora las hace también este.
+    No se le sacaron a la caja: `deploy-db-vector` sigue bajando el índice desde ahí;
   - `ssm:StartSession` **acotado por tag** (`Role = anybuddy-app`) más los documentos
     `AWS-StartSSHSession` y `SSM-SessionManagerRunShell`;
   - `ssm:TerminateSession` / `ResumeSession` / `DescribeInstanceInformation`;

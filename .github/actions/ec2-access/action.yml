@@ -6,12 +6,15 @@ description: >-
 # ============================================================================
 # POR QUE EXISTE ESTA ACCION
 # ============================================================================
-# Tres workflows entran al EC2: deploy-app, ingest y deploy-db-vector. Los tres
+# Dos workflows entran al EC2: deploy-app y deploy-db-vector. Los dos
 # necesitan exactamente lo mismo antes de poder hacer nada (OIDC, el plugin de
 # Session Manager, Ansible, el instance_id, esperar a que SSM responda).
 #
-# Sin esto, esos ~40 lineas viven copiadas en tres archivos y hay que acordarse
-# de tocar los tres cada vez. Aca se arregla en un solo lugar.
+# Sin esto, esos ~40 lineas viven copiadas en dos archivos y hay que acordarse
+# de tocar los dos cada vez. Aca se arregla en un solo lugar.
+#
+# ingest.yml era el tercero hasta el 19/08. Ya no la usa: la ingesta corre el
+# contenedor en el propio runner y no necesita ni SSM ni Ansible.
 # ============================================================================
 
 inputs:

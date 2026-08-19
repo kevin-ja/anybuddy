@@ -138,6 +138,21 @@ resource "aws_iam_role_policy" "gha_deploy" {
         Resource = ["arn:aws:s3:::${var.artifacts_bucket}/${var.tfstate_key}"]
       },
       {
+        Sid    = "ReadIngestInputs"
+        Effect = "Allow"
+        Action = ["s3:GetObject"]
+        Resource = [
+          "arn:aws:s3:::${var.artifacts_bucket}/knowledge_base/*",
+          "arn:aws:s3:::${var.artifacts_bucket}/models/*"
+        ]
+      },
+      {
+        Sid      = "WriteVectorDB"
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:AbortMultipartUpload"]
+        Resource = ["arn:aws:s3:::${var.artifacts_bucket}/vector_db/*"]
+      },
+      {
         Sid      = "AnsibleSsmTransfer"
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]

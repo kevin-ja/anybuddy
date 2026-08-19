@@ -4,11 +4,23 @@ name: ingest
 # WORKFLOW DE INGESTA — ejecutar la imagen y producir el vector_db
 # ============================================================================
 # Objetivo:
-#   Correr la imagen anybuddy-ingestion en el EC2, vectorizar el knowledge base
-#   y publicar el indice en s3://anybuddy-artifacts/vector_db/.
+#   Correr la imagen anybuddy-ingestion, vectorizar el knowledge base y
+#   publicar el indice en s3://anybuddy-artifacts/vector_db/.
 #
 # Aca TERMINA en S3. Dejar ese indice sirviendo en la caja es trabajo de
 # deploy-db-vector.yml, que arranca solo cuando este workflow termina bien.
+#
+# CORRE EN EL RUNNER, NO EN EL EC2 (cambiado el 19/08).
+# Antes entraba al EC2 por SSM y lanzaba el contenedor ahi. No entraba: en los
+# 2 GB de la caja conviven Chroma, la api con su reranker y el bot, y la
+# ingesta cargando el modelo de embeddings los desbordaba. Se quedaba sin
+# memoria, moria el agente de SSM y se llevaba puesto al bot (17 y 18/08).
+# El runner tiene 16 GB para la ingesta sola y sale $0 porque el repo es
+# publico. La caja de produccion ya no se toca durante la ingesta.
+#
+# Lo unico que cambio es DONDE corre el contenedor. La imagen se sigue
+# construyendo igual, se sigue guardando en el mismo ECR y el indice sigue
+# yendo al mismo bucket: build-ingest.yml y deploy-db-vector.yml no se enteran.
 #
 # ES MIXTO, automatico y manual, porque hay dos motivos para re-ingestar y son
 # de naturaleza distinta:
@@ -31,20 +43,27 @@ on:
 
   workflow_dispatch:
 
-# Mismo grupo que deploy-app y deploy-db-vector: los tres entran a la misma
-# caja y no pueden pisarse. Ver el comentario largo en deploy-app.yml.
+# Ya NO comparte el grupo "ec2" con deploy-app y deploy-db-vector: este
+# workflow dejo de entrar a la caja, asi que hacer fila con ellos solo lo
+# demoraria sin motivo.
+#
+# Grupo propio igual: dos ingestas en paralelo escribirian el mismo
+# chroma_storage.tar.gz en S3 y ganaria la que termine ultima, que no tiene por
+# que ser la del codigo mas nuevo.
 concurrency:
-  group: ec2
+  group: ingest
   cancel-in-progress: false
 
 env:
   AWS_REGION: us-east-2
-  ARTIFACTS_BUCKET: anybuddy-artifacts
-  TFSTATE_KEY: tfstate/anybuddy.tfstate
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
+
+    # Vectorizar tarda ~15-20 min y bajar la imagen suma unos 3. El techo esta
+    # para que un cuelgue no se coma horas de runner en silencio.
+    timeout-minutes: 60
 
     # Si el build de la imagen fallo, no hay nada nuevo que ejecutar.
     if: >-
@@ -55,37 +74,65 @@ jobs:
       id-token: write
       contents: read
 
+    # Sin checkout a proposito: todo lo que se ejecuta viene adentro de la
+    # imagen de ECR. El repo no hace falta para nada.
     steps:
-      - name: Checkout del repo
-        uses: actions/checkout@v4
-
-      - name: Preparar el acceso al EC2
-        id: ec2
-        uses: ./.github/actions/ec2-access
+      - name: Autenticar en AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-          role-arn: ${{ vars.AWS_ROLE_ARN }}
-          artifacts-bucket: ${{ env.ARTIFACTS_BUCKET }}
-          tfstate-key: ${{ env.TFSTATE_KEY }}
+
+      - name: Login en ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # El mismo archivo que consume el contenedor en la caja. Aca no existe
+      # porque el runner nace limpio en cada corrida, asi que se escribe del
+      # secret y se borra al final.
+      #
+      # El secret entra por env y NO interpolado en el script: si el valor
+      # trae una comilla, un $ o un salto raro, con ${{ }} el shell lo
+      # interpretaria como codigo. Por env es un dato y nada mas.
+      - name: Escribir el .env.prod
+        env:
+          ENV_PROD: ${{ secrets.ENV_PROD }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$ENV_PROD" > .env.prod
+          chmod 600 .env.prod
+          echo "Variables cargadas: $(grep -c '^[A-Z]' .env.prod)"
+
+      # La imagen pesa ~3 GB comprimida (~7 descomprimida) y el runner no anda
+      # sobrado de disco. Si algun dia falla el pull, el motivo se lee aca.
+      - name: Ver el espacio en disco
+        run: df -h /
+
+      - name: Bajar la imagen de ingestion
+        run: docker pull ${{ steps.login-ecr.outputs.registry }}/anybuddy-ingestion:latest
 
       # -----------------------------------------------------------------------
-      # Tarda 15-20 min. El runner se queda esperando porque es el control
-      # remoto: abre la sesion SSM, manda las ordenes y relaya la salida. El
-      # trabajo pesado corre en el EC2.
+      # En primer plano y sin async: aca no hay sesion SSM que se corte a los
+      # 20 min, asi que el contenedor puede tardar lo que tarde y su salida
+      # llega derecho al log.
       #
-      # El playbook corre la imagen :latest, que es la que build-ingest.yml
-      # acaba de publicar. Lanzado a mano justo despues de pushear codigo de la
-      # ingesta, esperar a que ese build termine o se ingesta con la vieja.
+      # Las credenciales van explicitas con -e. En el EC2 boto3 las descubria
+      # solo por el rol de la instancia; adentro de un contenedor en el runner
+      # no hay nada que descubrir, y sin esto la ingesta falla al bajar el
+      # faqs.txt con NoCredentialsError.
       #
-      # No lleva ENV_PROD: la ingesta no escribe el .env.prod, lo consume. Si
-      # no esta en la caja, el playbook falla con un mensaje claro pidiendo que
-      # se corra deploy-app.yml primero.
+      # Sin montar nada: el contenedor arma el indice adentro suyo y lo sube a
+      # S3. El disco del runner se tira a la basura cuando termina el job.
       # -----------------------------------------------------------------------
-      - name: Correr la ingesta
-        working-directory: infra/ansible
-        env:
-          ANSIBLE_FORCE_COLOR: "1"
+      - name: Vectorizar el knowledge base y publicarlo en S3
         run: |
-          ansible-playbook ingest.yml \
-            -e instance_id=${{ steps.ec2.outputs.instance_id }} \
-            -e ecr_registry=${{ steps.ec2.outputs.ecr_registry }}
+          docker run --rm \
+            --env-file .env.prod \
+            -e AWS_ACCESS_KEY_ID \
+            -e AWS_SECRET_ACCESS_KEY \
+            -e AWS_SESSION_TOKEN \
+            ${{ steps.login-ecr.outputs.registry }}/anybuddy-ingestion:latest
+
+      - name: Borrar el .env.prod
+        if: always()
+        run: rm -f .env.prod

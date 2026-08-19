@@ -40,14 +40,21 @@ graph TD
 Sistema backend de un bot de Discord que asiste a una comunidad de ~50 alumnos
 (~20 activos) con preguntas académicas, vía RAG.
 
-El sistema se divide en **dos procesos** que corren en momentos distintos, pero
-**en la misma máquina** (un solo EC2):
+El sistema se divide en **dos procesos** que corren en momentos distintos y en
+**máquinas distintas**:
 
 1. **Ingesta** — batch efímero que vectoriza los documentos y publica el índice.
-   Corre como contenedor *one-shot* (`docker run --rm`) **en el EC2**, disparado
-   por el workflow `ingest.yml`.
+   Corre como contenedor *one-shot* (`docker run --rm`) **en el runner de GitHub
+   Actions**, disparado por el workflow `ingest.yml`.
 2. **Servicio** — los 3 contenedores permanentes que atienden a los usuarios
-   (`restart: unless-stopped`). Corren en **el mismo EC2**.
+   (`restart: unless-stopped`). Corren en **el EC2**.
+
+> **La ingesta corría en el EC2 hasta el 19/08.** Se mudó al runner porque no entraba:
+> en los 2 GB de la caja conviven Chroma, la api con su reranker y el bot, y la ingesta
+> cargando el modelo de embeddings los desbordaba. La caja se quedaba sin memoria, moría
+> el agente de SSM y se caía el bot. El runner tiene 16 GB para la ingesta sola y sale $0
+> porque el repo es público. **Solo cambió la máquina:** la imagen se sigue construyendo
+> igual, sale del mismo ECR y el índice va al mismo bucket.
 
 - El handoff entre ambos es **S3** (buzón de artefactos, versionado recomendado).
 - La regla mental que gobierna todo: **api y bot son estado; la ingesta es un evento.**
@@ -94,15 +101,19 @@ flowchart TB
         S3[("S3: anybuddy-artifacts (versionado recomendado)<br/>knowledge_base/faqs.txt<br/>models/embedding_model.tar.gz<br/>vector_db/chroma_storage.tar.gz")]
     end
 
-    subgraph RUN_PLANE["PLANO DE RUN — 1 EC2 · always-on"]
+    subgraph INGEST_PLANE["PLANO DE INGESTA — runner de GHA · efímero"]
         direction TB
         TRG1["ingest.yml<br/>(tras build-ingest, o a mano si cambió el faqs.txt)"]
-        EVT["GHA runner → Ansible por SSM<br/>(playbook infra/ansible/ingest.yml)"]
-        EC2["EC2: corre imagen INGESTA (--rm)<br/>→ vector_db → S3"]
+        ING["runner: corre imagen INGESTA (--rm)<br/>→ vector_db → S3<br/>el EC2 no participa"]
+        TRG1 --> ING
+    end
+
+    subgraph RUN_PLANE["PLANO DE RUN — 1 EC2 · always-on"]
+        direction TB
         TRG2["deploy-db-vector.yml:<br/>playbook.yml --tags vector-db -e refresh_index=true"]
         TRG3["deploy-app.yml:<br/>playbook.yml --tags bootstrap,app"]
         EC2B["EC2: docker compose → chroma · api · bot sirviendo"]
-        TRG1 --> EVT --> EC2 --> TRG2 --> EC2B
+        TRG2 --> EC2B
         TRG3 --> EC2B
     end
 
@@ -114,8 +125,10 @@ flowchart TB
     GHA -. "workflow_run" .-> TRG3
     GHB -. "workflow_run" .-> TRG1
     ECR -- "docker pull (instance profile)" --> EC2B
-    S3 -- "lee knowledge_base/ + models/" --> EC2
-    EC2 -- "escribe vector_db/" --> S3
+    ECR -- "docker pull (OIDC)" --> ING
+    S3 -- "lee knowledge_base/ + models/" --> ING
+    ING -- "escribe vector_db/" --> S3
+    ING -. "workflow_run" .-> TRG2
     S3 -- "baja vector_db/" --> EC2B
     EC2B <-- "RAG / LLM" --> OAI
     EC2B <-- "WebSocket saliente" --> EXT
@@ -124,7 +137,8 @@ flowchart TB
     classDef store fill:#fff4e5,stroke:#f5a623,color:#000
     classDef ext fill:#eafaf1,stroke:#27ae60,color:#000
     class BUILD_PLANE,GHA,GHB ci
-    class RUN_PLANE,EVT,EC2,EC2B ci
+    class INGEST_PLANE,TRG1,ING ci
+    class RUN_PLANE,TRG2,TRG3,EC2B ci
     class ECR,S3,AWS_STORAGE store
     class EXT,OAI ext
 ```
@@ -133,10 +147,10 @@ flowchart TB
 
 ## 2. Proceso 1 — Ingesta (detalle)
 
-Corre como **contenedor efímero en el EC2** (`docker run --rm` de la imagen
-`anybuddy-ingestion` bajada de ECR). **No** corre en GitHub Actions: el runner
-solo construye imágenes y da la orden; el trabajo pesado —modelo de embeddings
-en RAM, vectorización de 15-20 min— sucede en el EC2.
+Corre como **contenedor efímero en el runner de GitHub Actions** (`docker run --rm` de
+la imagen `anybuddy-ingestion` bajada de ECR). El EC2 **no participa**: el trabajo
+pesado —modelo de embeddings en RAM, vectorización de 15-20 min— sucede en el runner,
+que tiene 16 GB para él solo, y la caja de producción sigue atendiendo sin enterarse.
 
 ### flujo
 
@@ -145,17 +159,20 @@ en RAM, vectorización de 15-20 min— sucede en el EC2.
 * El disparador es **mixto**, el workflow `ingest.yml`:
     **automático** cuando `build-ingest.yml` publica una imagen nueva (cambió el código de
     la ingesta), y **manual** (`workflow_dispatch`) cuando cambió el `faqs.txt`.
-* El runner de GHA no hace el trabajo, solo lo ordena: entra por SSM con Ansible
-    y lanza el contenedor en el EC2.
-* El EC2 corre la imagen de ingesta one-shot: chunking, embeddings e
-    indexación con Chroma, y sube el índice comprimido a S3 (vector_db/).
+* El runner baja la imagen del mismo ECR de siempre y la corre one-shot: chunking,
+    embeddings e indexación con Chroma, y sube el índice comprimido a S3 (vector_db/).
+    No hay Ansible ni SSM en todo el paso: el runner habla con AWS por su rol de OIDC,
+    y las credenciales entran al contenedor por `-e` porque ahí dentro no hay rol de
+    instancia que boto3 pueda descubrir solo.
+* El índice se arma **dentro del contenedor** y el disco del runner se descarta al
+    terminar el job. Nada queda en la máquina.
 * Al terminar encadena `deploy-db-vector.yml`, que corre `playbook.yml --tags vector-db`
     con `refresh_index=true`: baja el índice y recrea **solo** el contenedor `vector-db`.
 
 Flujo completo
 
 ```
-[build-ingest.yml, o Run workflow a mano] -> [ingest.yml: GHA runner] -(Ansible por SSM)-> [EC2] -(docker run --rm anybuddy-ingestion: chunking, embeddings, indexación Chroma)-> [vector_db: chroma_storage.tar.gz] -(subir)-> [S3: vector_db/] -(deploy-db-vector.yml)-> [vector-db recreado]
+[build-ingest.yml, o Run workflow a mano] -> [ingest.yml: GHA runner] -(docker run --rm anybuddy-ingestion: chunking, embeddings, indexación Chroma)-> [vector_db: chroma_storage.tar.gz] -(subir)-> [S3: vector_db/] -(deploy-db-vector.yml)-> [EC2: vector-db recreado]
 ```
 
 > **Por qué el disparo es mixto.** Son dos situaciones distintas. Cuando cambia el
@@ -216,7 +233,7 @@ flowchart TB
     end
 
     subgraph TRIG["Disparo del deploy (dos orígenes)"]
-        SSM["APP: deploy-app.yml → playbook --tags bootstrap,app<br/>INGESTA: ingest.yml → corre la imagen<br/>ÍNDICE: deploy-db-vector.yml → mismo playbook --tags vector-db"]
+        SSM["APP: deploy-app.yml → playbook --tags bootstrap,app<br/>ÍNDICE: deploy-db-vector.yml → mismo playbook --tags vector-db<br/>(ingest.yml no entra: corre en el runner)"]
     end
 
     ECR[("ECR<br/>anybuddy-{api,bot,ingestion}:&lt;tag&gt;")]

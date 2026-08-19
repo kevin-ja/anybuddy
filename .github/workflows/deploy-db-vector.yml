@@ -29,7 +29,7 @@ on:
   # cuando se recreo el EC2 o cuando la ingesta salio bien pero este paso no.
   workflow_dispatch:
 
-# Mismo grupo que deploy-app e ingest. Ver el comentario largo en deploy-app.yml.
+# Mismo grupo que deploy-app. Ver el comentario largo en deploy-app.yml.
 concurrency:
   group: ec2
   cancel-in-progress: false
