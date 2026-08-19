@@ -45,6 +45,10 @@ def publish_outputs(settings: Settings) -> str | None:
     print(f"📦 Comprimiendo {settings.vector_db_path} → {tar_path} ...")
     compress_dir(settings.vector_db_path, tar_path)
 
+    # Las credenciales no se pasan: boto3 las busca solo en el entorno. Hasta el
+    # 19/08 salian del rol de la instancia EC2; ahora la ingesta corre en el
+    # runner de GitHub y entran al contenedor por -e desde el workflow. Si esto
+    # falla con NoCredentialsError, el problema esta ahi y no en la policy.
     print(f"📤 Subiendo a s3://{settings.vector_db_s3_bucket}/{key} ...")
     get_s3_client(settings.aws_region).upload_file(
         str(tar_path), settings.vector_db_s3_bucket, key
