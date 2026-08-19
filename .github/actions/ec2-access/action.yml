@@ -15,6 +15,11 @@ description: >-
 #
 # ingest.yml era el tercero hasta el 19/08. Ya no la usa: la ingesta corre el
 # contenedor en el propio runner y no necesita ni SSM ni Ansible.
+#
+# OJO AL TOCAR ESTE ARCHIVO: esta en los paths de build-app.yml, asi que
+# cualquier cambio lo hace arrancar. No construye nada (el job changes arma una
+# matriz vacia) y el guard de deploy-app corta ahi, pero la corrida aparece
+# igual en la lista. Es esperado, no un fallo.
 # ============================================================================
 
 inputs:
